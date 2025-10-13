@@ -40,7 +40,7 @@ def get_projects_from_cryptorank():
         
         projects = []
         seen_urls = set()
-        max_projects = 1
+        max_projects = 20
         
         for idx, link in enumerate(project_links):
             if len(projects) >= max_projects:
@@ -99,7 +99,7 @@ def get_projects_from_rootdata():
         
         projects = []
         seen_names = set()
-        max_projects = 1
+        max_projects = 20
         
         for idx, link in enumerate(project_links):
             if len(projects) >= max_projects:

@@ -27,8 +27,6 @@ ENV/
 
 # Logs
 *.log
-fundraising.log
-fundraising_error.log
 
 # Output data (keep structure but ignore content)
 Fundraises-*/
