@@ -1,0 +1,73 @@
+name: Weekly Fundraising Scraper
+on:
+  schedule:
+    - cron: '0 9 * * 1'  # Every Monday at 9 AM UTC
+  workflow_dispatch:  # Allow manual trigger
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+          
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y wget gnupg
+          
+      - name: Install Python dependencies
+        run: |
+          pip install playwright beautifulsoup4 pandas requests slack-sdk
+          playwright install chromium
+          
+      - name: Run fundraising scraper
+        env:
+          APOLLO_API_KEY: ${{ secrets.APOLLO_API_KEY }}
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+        run: python fundraising.py
+        
+      - name: Upload results as artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: funding-data-${{ github.run_number }}
+          path: |
+            Fundraises-*
+            funding_data.*
+          retention-days: 30
+          
+      - name: Upload to Slack
+        if: always()
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+        run: |
+          # Find the most recent CSV file
+          CSV_FILE=$(find . -name "funding_data.csv" -type f -exec ls -t {} + | head -n1)
+          if [ -f "$CSV_FILE" ]; then
+            echo "Found CSV file: $CSV_FILE"
+            python -c "
+          import os
+          from slack_sdk import WebClient
+          from slack_sdk.errors import SlackApiError
+          
+          client = WebClient(token=os.environ['SLACK_BOT_TOKEN'])
+          try:
+              response = client.files_upload_v2(
+                  channel='C09CKTZ61DK',
+                  file='$CSV_FILE',
+                  title='🚀 New Fundraising Leads Available',
+                  initial_comment='All these people raised in the past week. Make sure you reach out!'
+              )
+              print('✅ File uploaded to Slack successfully!')
+          except SlackApiError as e:
+              print(f'❌ Slack upload failed: {e}')
+          "
+          else
+            echo "No CSV file found to upload"
+          fi
