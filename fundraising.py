@@ -3,9 +3,12 @@ from bs4 import BeautifulSoup
 import time
 import requests
 import re
+from urllib.parse import urlparse
+import json
+import os
 
 # Apollo.io API Configuration
-APOLLO_API_KEY = "oiiVIE2ufVWw3euhP3XLgA"
+APOLLO_API_KEY = os.getenv("APOLLO_API_KEY", "oiiVIE2ufVWw3euhP3XLgA")
 APOLLO_API_URL = "https://api.apollo.io/v1/mixed_people/search"
 
 def get_projects_from_cryptorank():
@@ -40,7 +43,7 @@ def get_projects_from_cryptorank():
         
         projects = []
         seen_urls = set()
-        max_projects = 20
+        max_projects = 10
         
         for idx, link in enumerate(project_links):
             if len(projects) >= max_projects:
@@ -57,11 +60,22 @@ def get_projects_from_cryptorank():
                 if not href.startswith("http"):
                     href = "https://cryptorank.io" + href
                 
+                # Fix: Convert /ico/ URLs to /price/ URLs for proper project page access
+                if '/ico/' in href:
+                    href = href.replace('/ico/', '/price/')
+                    print(f"   🔄 Converted ICO URL to price URL: {href}")
+                
                 if href in seen_urls:
                     continue
                 
                 seen_urls.add(href)
-                projects.append({"name": text.strip(), "url": href})
+                projects.append({
+                    "name": text.strip(), 
+                    "url": href,
+                    "source": "cryptorank_funding_rounds",
+                    "source_url": "https://cryptorank.io/funding-rounds",
+                    "source_type": "funding_platform"
+                })
                 
             except Exception as e:
                 print(f"   ⚠️  Error processing link {idx}: {str(e)}")
@@ -99,7 +113,7 @@ def get_projects_from_rootdata():
         
         projects = []
         seen_names = set()
-        max_projects = 20
+        max_projects = 10
         
         for idx, link in enumerate(project_links):
             if len(projects) >= max_projects:
@@ -125,7 +139,9 @@ def get_projects_from_rootdata():
                 projects.append({
                     "name": clean_name,
                     "url": href,
-                    "source": "rootdata"
+                    "source": "rootdata_fundraising",
+                    "source_url": "https://www.rootdata.com/Fundraising",
+                    "source_type": "funding_platform"
                 })
                 
             except Exception as e:
@@ -159,7 +175,9 @@ def get_all_projects():
             all_projects.append({
                 "name": clean_name,
                 "url": project['url'],
-                "source": project.get('source', 'cryptorank')
+                "source": project.get('source', 'cryptorank_funding_rounds'),
+                "source_url": project.get('source_url', 'https://cryptorank.io/funding-rounds'),
+                "source_type": project.get('source_type', 'funding_platform')
             })
     
     print(f"\n{'='*60}")
@@ -171,7 +189,216 @@ def get_all_projects():
     
     return all_projects
 
-def fetch_team_from_apollo(company_name):
+def extract_company_website(project_url):
+    """Extract company website from main project page (not ICO/team pages)"""
+    print(f"\n🌐 Extracting company website from main project page: {project_url}")
+    
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_page()
+        
+        try:
+            page.goto(project_url, wait_until="networkidle", timeout=15000)
+            print("✅ Main project page loaded")
+            
+            time.sleep(3)  # Give more time for dynamic content
+            html = page.content()
+            soup = BeautifulSoup(html, "html.parser")
+            
+            website = None
+            
+            # For CryptoRank: Look for website link in the Links section
+            if 'cryptorank.io' in project_url:
+                print("   🔍 Looking for website in CryptoRank Links section...")
+                
+                # Look for the "Links" section with multiple approaches
+                links_section = None
+                
+                # First, try to find the exact "Links" text (not containing "Links")
+                links_text = soup.find(text=lambda text: text and text.strip() == 'Links')
+                if links_text:
+                    links_section = links_text.parent
+                    print(f"   ✅ Found exact 'Links' text in {links_section.name}")
+                else:
+                    # Fallback to other methods
+                    links_section = soup.find('div', string=re.compile(r'Links', re.I))
+                    if not links_section:
+                        links_section = soup.find('h3', string=re.compile(r'Links', re.I))
+                    if not links_section:
+                        links_section = soup.find('span', string=re.compile(r'Links', re.I))
+                    if not links_section:
+                        # Look for any element containing "Links"
+                        links_section = soup.find(text=re.compile(r'Links', re.I))
+                        if links_section:
+                            links_section = links_section.parent
+                
+                if links_section:
+                    print("   ✅ Found 'Links' section")
+                    # Find the parent container of the Links section
+                    links_container = links_section.find_parent()
+                    if links_container:
+                        # Look for the "Website" button specifically with more comprehensive search
+                        website_buttons = links_container.find_all('a', href=True)
+                        print(f"   Found {len(website_buttons)} links in Links section")
+                        
+                        for link in website_buttons:
+                            href = link.get('href', '')
+                            text = link.get_text(strip=True).lower()
+                            
+                            print(f"   Checking link: '{text}' -> {href}")
+                            
+                            # Look specifically for the "Website" button - improved matching
+                            if ('website' in text or 'site' in text) and href.startswith('http'):
+                                # Additional validation to ensure it's not a social media link
+                                if not any(social in href.lower() for social in ['twitter', 'telegram', 'discord', 'medium', 'github', 'youtube', 'linkedin', 'facebook', 'instagram', 'x.com', 'breakingthenews.net']):
+                                    website = href
+                                    print(f"   ✅ Found Website button: {href}")
+                                    break
+                
+                # If no website found in Links section, look for sibling elements
+                if not website and links_section:
+                    print("   🔍 No website in Links section, checking sibling elements...")
+                    links_parent = links_section.find_parent()
+                    if links_parent:
+                        # Look for sibling divs that might contain the links
+                        siblings = links_parent.find_next_siblings()
+                        for sibling in siblings:
+                            if sibling.name == 'div':
+                                sibling_links = sibling.find_all('a', href=True)
+                                print(f"   Found {len(sibling_links)} links in sibling div")
+                                
+                                for link in sibling_links:
+                                    href = link.get('href', '')
+                                    text = link.get_text(strip=True).lower()
+                                    
+                                    print(f"   Checking sibling link: '{text}' -> {href}")
+                                    
+                                    # Look for website links
+                                    if ('website' in text or 'site' in text) and href.startswith('http'):
+                                        if not any(social in href.lower() for social in ['twitter', 'telegram', 'discord', 'medium', 'github', 'youtube', 'linkedin', 'facebook', 'instagram', 'x.com', 'breakingthenews.net']):
+                                            website = href
+                                            print(f"   ✅ Found Website in sibling: {href}")
+                                            break
+                                if website:
+                                    break
+                
+                # If still no website found, try looking for the Links section more broadly
+                if not website:
+                    print("   🔍 Trying broader search for Links section...")
+                    # Look for any section that might contain links
+                    potential_sections = soup.find_all(['div', 'section'], class_=lambda x: x and any(keyword in x.lower() for keyword in ['link', 'social', 'connect']))
+                    
+                    for section in potential_sections:
+                        links_in_section = section.find_all('a', href=True)
+                        for link in links_in_section:
+                            href = link.get('href', '')
+                            text = link.get_text(strip=True).lower()
+                            
+                            # Look for website indicators
+                            if ('website' in text or 'site' in text) and href.startswith('http'):
+                                if not any(social in href.lower() for social in ['twitter', 'telegram', 'discord', 'medium', 'github', 'youtube', 'linkedin', 'facebook', 'instagram', 'x.com', 'breakingthenews.net']):
+                                    website = href
+                                    print(f"   ✅ Found Website in broader search: {href}")
+                                    break
+                        if website:
+                            break
+                
+                # If no Website button found in Links section, try broader search
+                if not website:
+                    print("   🔍 No Website button found, trying broader search...")
+                    all_links = soup.find_all('a', href=True)
+                    print(f"   Found {len(all_links)} total links on page")
+                    
+                    # First, try to find links that look like company websites
+                    potential_websites = []
+                    for link in all_links:
+                        href = link.get('href', '')
+                        text = link.get_text(strip=True)
+                        
+                        # Skip social media and internal links
+                        if any(skip in href.lower() for skip in ['twitter', 'telegram', 'discord', 'medium', 'github', 'youtube', 'linkedin', 'facebook', 'instagram', 'x.com', 'cryptorank.io', 'bcgame.bet', 'breakingthenews.net']):
+                            continue
+                        
+                        # Look for main website indicators
+                        if href.startswith('http'):
+                            domain = urlparse(href).netloc.lower()
+                            # Check if it looks like a company website (simple domain names)
+                            if '.' in domain and not any(skip in domain for skip in ['twitter', 'telegram', 'discord', 'medium', 'github', 'youtube', 'linkedin', 'facebook', 'instagram', 'x.com', 'notion.so', 'calendly.com', 'drive.google.com', 'apps.apple.com']):
+                                potential_websites.append((href, text, domain))
+                    
+                    # Sort by domain length (shorter domains are more likely to be company websites)
+                    potential_websites.sort(key=lambda x: len(x[2]))
+                    
+                    if potential_websites:
+                        website = potential_websites[0][0]
+                        print(f"   ✅ Found potential website: {website}")
+                    else:
+                        print("   ⚠️  No suitable website found")
+            
+            # For RootData: Look for website link in project details
+            elif 'rootdata.com' in project_url:
+                print("   🔍 Looking for website in RootData project details...")
+                
+                # Use longer timeout for RootData pages
+                try:
+                    page.goto(project_url, wait_until="load", timeout=20000)
+                    time.sleep(3)
+                    html = page.content()
+                    soup = BeautifulSoup(html, "html.parser")
+                    print("   ✅ RootData page loaded successfully")
+                except:
+                    print("   ⚠️  RootData page load failed, using existing content")
+                
+                # Look for website links in the main content area
+                website_links = soup.find_all('a', href=True)
+                print(f"   Found {len(website_links)} links on RootData page")
+                
+                # Look for the specific website link pattern (like tempo.xyz)
+                # This should be in the main content area below the project description
+                for link in website_links:
+                    href = link.get('href', '')
+                    text = link.get_text(strip=True)
+                    
+                    # Skip social media and internal links
+                    if any(skip in href.lower() for skip in ['twitter', 'telegram', 'discord', 'medium', 'github', 'youtube', 'linkedin', 'facebook', 'instagram', 'x.com', 'rootdata.com']):
+                        continue
+                    
+                    # Look for main website indicators
+                    if href.startswith('http'):
+                        # Check if this looks like a company website (not social media or services)
+                        domain = urlparse(href).netloc.lower()
+                        if not any(skip in domain for skip in ['twitter', 'telegram', 'discord', 'medium', 'github', 'youtube', 'linkedin', 'facebook', 'instagram', 'x.com', 'notion.so', 'calendly.com', 'drive.google.com', 'apps.apple.com']):
+                            website = href
+                            print(f"   ✅ Found company website link: {href}")
+                            break
+            
+            browser.close()
+            
+            if website:
+                # Clean up the website URL
+                if not website.startswith('http'):
+                    website = 'https://' + website
+                
+                # Extract domain for Apollo search
+                try:
+                    domain = urlparse(website).netloc
+                    if domain.startswith('www.'):
+                        domain = domain[4:]
+                    print(f"✅ Successfully found website: {website} (domain: {domain})")
+                    return {"website": website, "domain": domain}
+                except:
+                    print(f"⚠️  Could not parse website URL: {website}")
+                    return None
+            else:
+                print("⚠️  No company website found on main project page")
+                return None
+                
+        except Exception as e:
+            print(f"❌ Error extracting website: {str(e)}")
+            browser.close()
+            return None
+
+def fetch_team_from_apollo(company_name, company_website=None):
     """Apollo.io API fallback for team members"""
     print(f"\n{'='*60}")
     print(f"🔍 APOLLO FALLBACK: Searching for {company_name} team on Apollo.io")
@@ -191,9 +418,23 @@ def fetch_team_from_apollo(company_name):
         "CEO", "CFO", "COO", "Chief",
         "Co-Founder", "Founder", "Co Founder",
         "VP", "Vice President", "V.P.",
-        "Director", "Managing Director"
+        "Director", "Managing Director",
+        "General Manager", "Growth",
+        "Chief of Staff"
     ]
     
+    # Use website domain for more accurate search if available
+    if company_website and company_website.get('domain'):
+        domain = company_website['domain']
+        print(f"   Using website domain for search: '{domain}'")
+        payload = {
+            "q_organization_domain": domain,
+            "person_titles": target_titles,
+            "page": 1,
+            "per_page": 25
+        }
+    else:
+        print(f"   Using company name for search: '{clean_name}'")
     payload = {
         "q_organization_name": clean_name,
         "person_titles": target_titles,
@@ -233,7 +474,10 @@ def fetch_team_from_apollo(company_name):
                     "name": name,
                     "role": title if title else None,
                     "linkedin_url": linkedin_url,
-                    "source": "apollo"
+                    "source": "apollo_api",
+                    "source_url": "https://api.apollo.io/v1/mixed_people/search",
+                    "source_type": "people_database",
+                    "apollo_search_method": "domain" if company_website and company_website.get('domain') else "company_name"
                 }
                 members.append(member_data)
                 
@@ -332,7 +576,9 @@ def fetch_team_members(project_url):
                     "name": name,
                     "role": role,
                     "linkedin_url": linkedin_url,
-                    "source": "cryptorank"
+                    "source": "cryptorank_team_page",
+                    "source_url": team_url,
+                    "source_type": "project_team_page"
                 }
                 members.append(member_data)
                 
@@ -372,28 +618,40 @@ def gather_all():
         
         team = []
         
-        # Only try CryptoRank team page if project is from CryptoRank
-        if project['source'] == 'cryptorank':
-            team = fetch_team_members(project['url'])
-        else:
-            print("   ℹ️  RootData project - skipping team page, will use Apollo")
+        # Extract company website first
+        website_info = extract_company_website(project['url'])
         
-        # Determine if Apollo is needed
-        should_use_apollo = False
-        
-        if not team:
-            print("   ⚠️  No team members found - will try Apollo")
+        # Use Apollo directly when website found to save resources
+        if website_info and website_info.get('domain'):
+            print(f"   ✅ Website found! Using Apollo with domain: {website_info['domain']}")
+            team = []
             should_use_apollo = True
         else:
-            members_without_linkedin = [m for m in team if not m.get('linkedin_url')]
-            if members_without_linkedin:
-                print(f"   ⚠️  {len(members_without_linkedin)} team member(s) have no LinkedIn - will try Apollo")
+            # Fallback to original method if no website found
+            print("   ⚠️  No website found, using fallback method")
+            
+            # Only try CryptoRank team page if project is from CryptoRank
+            if project['source'] == 'cryptorank_funding_rounds':
+                team = fetch_team_members(project['url'])
+            else:
+                print("   ℹ️  RootData project - skipping team page, will use Apollo")
+            
+            # Determine if Apollo is needed
+            should_use_apollo = False
+            
+            if not team:
+                print("   ⚠️  No team members found - will try Apollo")
                 should_use_apollo = True
+            else:
+                members_without_linkedin = [m for m in team if not m.get('linkedin_url')]
+                if members_without_linkedin:
+                    print(f"   ⚠️  {len(members_without_linkedin)} team member(s) have no LinkedIn - will try Apollo")
+                    should_use_apollo = True
         
-        # Apollo fallback
+        # Apollo search
         if should_use_apollo:
             time.sleep(2)
-            apollo_team = fetch_team_from_apollo(project['name'])
+            apollo_team = fetch_team_from_apollo(project['name'], website_info)
             
             if apollo_team:
                 existing_names = {m['name'].lower() for m in team}
@@ -420,24 +678,49 @@ def gather_all():
                                     print(f"   📝 Added role for {existing_member['name']}: {apollo_member['role']}")
                                 
                                 # Update source to show it came from both
-                                if existing_member.get('source') == 'cryptorank':
-                                    existing_member['source'] = 'cryptorank + apollo'
+                                if existing_member.get('source') == 'cryptorank_team_page':
+                                    existing_member['source'] = 'cryptorank_team_page + apollo_api'
+                                    existing_member['source_url'] = f"{existing_member.get('source_url', '')} + {apollo_member.get('source_url', '')}"
                                 break
         
         # Add each team member as individual entry with project info
         for member in team:
-            # Determine final source value
-            member_source = member.get('source', 'apollo')
-            if member_source == 'apollo' and project['source'] == 'rootdata':
-                member_source = 'rootdata + apollo'
-            
             person_entry = {
                 "name": member['name'],
                 "role": member.get('role'),
                 "linkedin_url": member.get('linkedin_url'),
-                "source": member_source,
+                "source": member.get('source', 'cryptorank_team_page'),
+                "source_url": member.get('source_url', ''),
+                "source_type": member.get('source_type', 'project_team_page'),
+                "apollo_search_method": member.get('apollo_search_method', ''),
                 "project": project['name'],
-                "project_url": project['url']
+                "project_url": project['url'],
+                "project_source": project.get('source', 'cryptorank_funding_rounds'),
+                "project_source_url": project.get('source_url', 'https://cryptorank.io/funding-rounds'),
+                "project_source_type": project.get('source_type', 'funding_platform'),
+                "company_website": website_info['website'] if website_info else None,
+                "company_domain": website_info['domain'] if website_info else None
+            }
+            all_people.append(person_entry)
+        
+        # If no team members found, still add project info with website
+        if not team:
+            print(f"   📝 No team members found, adding project info with website")
+            person_entry = {
+                "name": None,
+                "role": None,
+                "linkedin_url": None,
+                "source": "project_only",
+                "source_url": "",
+                "source_type": "project_data_only",
+                "apollo_search_method": "",
+                "project": project['name'],
+                "project_url": project['url'],
+                "project_source": project.get('source', 'cryptorank_funding_rounds'),
+                "project_source_url": project.get('source_url', 'https://cryptorank.io/funding-rounds'),
+                "project_source_type": project.get('source_type', 'funding_platform'),
+                "company_website": website_info['website'] if website_info else None,
+                "company_domain": website_info['domain'] if website_info else None
             }
             all_people.append(person_entry)
         
@@ -457,8 +740,79 @@ import os
 from datetime import datetime
 
 # Slack Configuration
-SLACK_BOT_TOKEN = "xoxb-5736340339410-9698047778609-dqUa7c0cxcQyM7zdz2bcUPnm"
-SLACK_CHANNEL = "C09CKTZ61DK"
+SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN", "xoxb-5736340339410-9698047778609-dqUa7c0cxcQyM7zdz2bcUPnm")
+SLACK_CHANNEL = os.getenv("SLACK_CHANNEL", "C09CKTZ61DK")
+
+def send_error_to_slack(error_message):
+    """Send error notification to Slack"""
+    print(f"\n🚨 Sending error notification to Slack...")
+    
+    try:
+        from slack_sdk import WebClient
+        from slack_sdk.errors import SlackApiError
+        
+        client = WebClient(token=SLACK_BOT_TOKEN)
+        
+        # Send error message
+        response = client.chat_postMessage(
+            channel=SLACK_CHANNEL,
+            text=f"🚨 Fundraising Scraper Failed: {error_message}"
+        )
+        
+        print(f"✅ Error notification sent to Slack!")
+        return True
+        
+    except Exception as e:
+        print(f"❌ Failed to send error notification: {str(e)}")
+        return False
+
+def send_success_to_slack(people_count, projects_count):
+    """Send success notification to Slack"""
+    print(f"\n✅ Sending success notification to Slack...")
+    
+    try:
+        from slack_sdk import WebClient
+        from slack_sdk.errors import SlackApiError
+        
+        client = WebClient(token=SLACK_BOT_TOKEN)
+        
+        # Send success message
+        response = client.chat_postMessage(
+            channel=SLACK_CHANNEL,
+            text=f"✅ Fundraising Scraper Success! Found {people_count} people from {projects_count} projects. Check the uploaded CSV file for details."
+        )
+        
+        print(f"✅ Success notification sent to Slack!")
+        return True
+        
+    except Exception as e:
+        print(f"❌ Failed to send success notification: {str(e)}")
+        return False
+
+def send_error_to_slack(error_message):
+    """Send error notification to Slack"""
+    print(f"\n🚨 Sending error notification to Slack...")
+    
+    try:
+        from slack_sdk import WebClient
+        from slack_sdk.errors import SlackApiError
+        
+        client = WebClient(token=SLACK_BOT_TOKEN)
+        
+        response = client.chat_postMessage(
+            channel=SLACK_CHANNEL,
+            text=f"🚨 Fundraising Scraper Failed: {error_message}"
+        )
+        
+        print(f"✅ Error notification sent to Slack")
+        return True
+        
+    except SlackApiError as e:
+        print(f"❌ Failed to send error notification: {e.response['error']}")
+        return False
+    except Exception as e:
+        print(f"❌ Failed to send error notification: {str(e)}")
+        return False
 
 def send_to_slack(csv_file_path):
     """Send CSV file to Slack channel using Bot API"""
@@ -569,6 +923,14 @@ if __name__ == "__main__":
             # Convert to CSV
             print(f"\n📊 Converting to CSV...")
             df = pd.DataFrame(people)
+            
+            # Ensure role names are properly included in CSV
+            if 'role' in df.columns:
+                df['role'] = df['role'].fillna('No Role Found')
+                print(f"   ✅ Role names included in CSV output")
+            else:
+                print(f"   ⚠️  No role column found in data")
+            
             csv_filename = os.path.join(folder_name, "funding_data.csv")
             df.to_csv(csv_filename, index=False)
             print(f"✅ CSV saved: {csv_filename}")
@@ -576,21 +938,41 @@ if __name__ == "__main__":
             # Display summary
             print(f"\n📈 SUMMARY:")
             print(f"   Total people: {len(people)}")
-            cryptorank_count = sum(1 for p in people if 'cryptorank' in p.get('source', ''))
-            apollo_count = sum(1 for p in people if 'apollo' in p.get('source', ''))
+            cryptorank_team_count = sum(1 for p in people if 'cryptorank_team_page' in p.get('source', ''))
+            apollo_count = sum(1 for p in people if 'apollo_api' in p.get('source', ''))
             rootdata_count = sum(1 for p in people if 'rootdata' in p.get('source', ''))
-            print(f"   From CryptoRank: {cryptorank_count}")
+            project_only_count = sum(1 for p in people if p.get('source') == 'project_only')
+            combined_count = sum(1 for p in people if '+' in p.get('source', ''))
+            print(f"   From CryptoRank Team Pages: {cryptorank_team_count}")
             print(f"   From RootData: {rootdata_count}")
-            print(f"   From Apollo: {apollo_count}")
+            print(f"   From Apollo API: {apollo_count}")
+            print(f"   Combined Sources: {combined_count}")
+            print(f"   Project Data Only: {project_only_count}")
             print(f"   📁 Files saved in: {folder_name}/")
             
             # Send to Slack
-            send_to_slack(csv_filename)
+            slack_success = send_to_slack(csv_filename)
+            
+            # Send success notification
+            if slack_success:
+                send_success_to_slack(len(people), len(projects))
+            else:
+                print("⚠️  Slack upload failed, but data was saved locally")
     
     except Exception as e:
-        print(f"\n❌ FATAL ERROR: {str(e)}")
+        error_message = f"FATAL ERROR: {str(e)}"
+        print(f"\n❌ {error_message}")
         import traceback
         traceback.print_exc()
+        
+        # Send error notification to Slack
+        try:
+            send_error_to_slack(error_message)
+        except:
+            print("❌ Failed to send error notification to Slack")
+        
+        # Re-raise the exception to fail the GitHub Action
+        raise
     
     print("\n" + "#"*60)
     print("# Script execution finished")

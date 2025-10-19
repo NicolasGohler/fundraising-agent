@@ -1,53 +1,95 @@
-# Fundraising Lead Scraper
+# Fundraising Scraper
 
-Automated weekly scraper that collects fundraising data from CryptoRank, RootData, and Apollo.io, then uploads the results to Slack.
+Automated scraper that collects fundraising data from CryptoRank and RootData, extracts team member information, and sends results to Slack.
 
 ## Features
 
-- **Multi-source data collection**: CryptoRank, RootData, and Apollo.io
-- **Automatic team member extraction** with LinkedIn profiles
-- **CTO filtering** (excludes CTOs as requested)
-- **Dated folder organization** (e.g., `Fundraises - 10-13/`)
-- **Slack integration** with file uploads
-- **Weekly automation** via GitHub Actions
-
-## Schedule
-
-Runs automatically every **Monday at 9 AM UTC** via GitHub Actions.
-
-## Output
-
-- `funding_data.csv` - Person-centric CSV with LinkedIn profiles
-- `funding_data.json` - Raw JSON data
-- Organized in dated folders: `Fundraises - MM-DD/`
-
-## Setup
-
-1. **Fork this repository**
-2. **Add secrets** in GitHub repository settings:
-   - `APOLLO_API_KEY`: Your Apollo.io API key
-   - `SLACK_BOT_TOKEN`: Your Slack bot token
-3. **Enable GitHub Actions** in repository settings
-
-## Manual Run
-
-You can trigger the workflow manually:
-1. Go to **Actions** tab
-2. Select **Weekly Fundraising Scraper**
-3. Click **Run workflow**
+- **Multi-source data collection**: CryptoRank funding rounds and RootData fundraising
+- **Team member extraction**: From project team pages and Apollo.io API
+- **Website extraction**: Automatically finds company websites
+- **Slack integration**: Sends results and notifications to Slack
+- **GitHub Actions**: Automated weekly runs every Monday
+- **Detailed source tracking**: Comprehensive metadata about data sources
 
 ## Data Sources
 
-- **CryptoRank**: Project funding rounds and team pages
-- **RootData**: Additional fundraising projects
-- **Apollo.io**: Team member enrichment and LinkedIn profiles
+### Project Sources
+- **CryptoRank Funding Rounds**: `cryptorank_funding_rounds`
+- **RootData Fundraising**: `rootdata_fundraising`
 
-## Output Format
+### Team Member Sources
+- **CryptoRank Team Pages**: `cryptorank_team_page`
+- **Apollo API**: `apollo_api`
+- **Combined Sources**: `cryptorank_team_page + apollo_api`
 
-Each person includes:
-- `name` - Team member name
-- `role` - Job title (CEO, CFO, Co-Founder, etc.)
-- `linkedin_url` - LinkedIn profile URL
-- `source` - Data source (cryptorank, rootdata + apollo, etc.)
-- `project` - Company name
-- `project_url` - Project page URL
+## Setup
+
+### Local Development
+
+1. Clone the repository
+2. Create a virtual environment:
+   ```bash
+   python -m venv venv
+   source venv/bin/activate  # On Windows: venv\Scripts\activate
+   ```
+3. Install dependencies:
+   ```bash
+   pip install -r requirements.txt
+   playwright install chromium
+   ```
+4. Set environment variables:
+   ```bash
+   export APOLLO_API_KEY="your_apollo_api_key"
+   export SLACK_BOT_TOKEN="your_slack_bot_token"
+   export SLACK_CHANNEL="your_slack_channel_id"
+   ```
+5. Run the script:
+   ```bash
+   python fundraising.py
+   ```
+
+### GitHub Actions Setup
+
+1. Add the following secrets to your GitHub repository:
+   - `APOLLO_API_KEY`: Your Apollo.io API key
+   - `SLACK_BOT_TOKEN`: Your Slack bot token
+   - `SLACK_CHANNEL`: Your Slack channel ID (e.g., C09CKTZ61DK)
+
+2. The workflow will automatically run every Monday at 9 AM UTC
+
+## Output
+
+The script generates:
+- **JSON file**: Complete data with all metadata
+- **CSV file**: Formatted for easy analysis
+- **Slack notification**: Success/failure notifications
+- **GitHub artifacts**: Uploaded results for each run
+
+## Data Schema
+
+Each person record includes:
+- `name`: Person's name
+- `role`: Job title/role
+- `linkedin_url`: LinkedIn profile URL
+- `source`: Data source (e.g., `apollo_api`, `cryptorank_team_page`)
+- `source_url`: URL of the data source
+- `source_type`: Type of source (e.g., `people_database`, `project_team_page`)
+- `apollo_search_method`: How Apollo was searched (`domain` or `company_name`)
+- `project`: Project name
+- `project_url`: Project URL
+- `project_source`: Where the project was found
+- `project_source_url`: URL of the project source
+- `project_source_type`: Type of project source
+- `company_website`: Company website URL
+- `company_domain`: Company domain
+
+## Requirements
+
+- Python 3.9+
+- Playwright with Chromium
+- Apollo.io API key
+- Slack bot with appropriate permissions
+
+## License
+
+MIT License
