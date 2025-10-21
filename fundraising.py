@@ -7,6 +7,9 @@ from urllib.parse import urlparse
 import json
 import os
 
+# Configuration
+MAX_PROJECTS = 17  # Maximum projects to collect from each source
+
 # Apollo.io API Configuration
 APOLLO_API_KEY = os.getenv("APOLLO_API_KEY", "oiiVIE2ufVWw3euhP3XLgA")
 APOLLO_API_URL = "https://api.apollo.io/v1/mixed_people/search"
@@ -43,7 +46,7 @@ def get_projects_from_cryptorank():
         
         projects = []
         seen_urls = set()
-        max_projects = 10
+        max_projects = MAX_PROJECTS
         
         for idx, link in enumerate(project_links):
             if len(projects) >= max_projects:
@@ -113,7 +116,7 @@ def get_projects_from_rootdata():
         
         projects = []
         seen_names = set()
-        max_projects = 10
+        max_projects = MAX_PROJECTS
         
         for idx, link in enumerate(project_links):
             if len(projects) >= max_projects:
@@ -789,30 +792,6 @@ def send_success_to_slack(people_count, projects_count):
         print(f"❌ Failed to send success notification: {str(e)}")
         return False
 
-def send_error_to_slack(error_message):
-    """Send error notification to Slack"""
-    print(f"\n🚨 Sending error notification to Slack...")
-    
-    try:
-        from slack_sdk import WebClient
-        from slack_sdk.errors import SlackApiError
-        
-        client = WebClient(token=SLACK_BOT_TOKEN)
-        
-        response = client.chat_postMessage(
-            channel=SLACK_CHANNEL,
-            text=f"🚨 Fundraising Scraper Failed: {error_message}"
-        )
-        
-        print(f"✅ Error notification sent to Slack")
-        return True
-        
-    except SlackApiError as e:
-        print(f"❌ Failed to send error notification: {e.response['error']}")
-        return False
-    except Exception as e:
-        print(f"❌ Failed to send error notification: {str(e)}")
-        return False
 
 def send_to_slack(csv_file_path):
     """Send CSV file to Slack channel using Bot API"""
@@ -955,7 +934,9 @@ if __name__ == "__main__":
             
             # Send success notification
             if slack_success:
-                send_success_to_slack(len(people), len(projects))
+                # Count unique projects from the people data
+                unique_projects = len(set(p.get('project') for p in people if p.get('project')))
+                send_success_to_slack(len(people), unique_projects)
             else:
                 print("⚠️  Slack upload failed, but data was saved locally")
     

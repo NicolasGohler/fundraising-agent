@@ -19,24 +19,12 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
+MANIFEST
 
 # Virtual Environment
 venv/
 env/
 ENV/
-
-# Logs
-*.log
-
-# Output data (keep structure but ignore content)
-Fundraises-*/
-funding_data.csv
-funding_data.json
-
-# macOS
-.DS_Store
-.AppleDouble
-.LSOverride
 
 # IDE
 .vscode/
@@ -44,6 +32,15 @@ funding_data.json
 *.swp
 *.swo
 
-# Temporary files
-*.tmp
-*.temp
+# OS
+.DS_Store
+Thumbs.db
+
+# Project specific
+delete.py
+*.log
+Fundraises - */
+
+# Secrets (just in case)
+.env
+secrets.txt
