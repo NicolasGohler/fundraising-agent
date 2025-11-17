@@ -8,7 +8,7 @@ import json
 import os
 
 # Configuration
-MAX_PROJECTS = 17  # Maximum projects to collect from each source
+MAX_PROJECTS = 15  # Maximum projects to collect from each source (reduced by 10%)
 
 # Apollo.io API Configuration
 APOLLO_API_KEY = os.getenv("APOLLO_API_KEY", "oiiVIE2ufVWw3euhP3XLgA")
@@ -803,10 +803,14 @@ def send_to_slack(csv_file_path):
         
         client = WebClient(token=SLACK_BOT_TOKEN)
         
-        # Try different channel formats
+        # Try different channel formats - ensure we only send once
         channel_formats = [SLACK_CHANNEL, f"#{SLACK_CHANNEL}"]
+        file_sent = False
         
         for channel_format in channel_formats:
+            if file_sent:
+                break  # Ensure we only send once
+                
             try:
                 print(f"   Trying channel format: '{channel_format}'")
                 # Upload the CSV file with a descriptive message
@@ -819,6 +823,7 @@ def send_to_slack(csv_file_path):
                 
                 print(f"✅ File successfully uploaded to Slack!")
                 print(f"   📁 File URL: {response['file']['permalink']}")
+                file_sent = True
                 return True
                 
             except SlackApiError as e:
@@ -830,7 +835,8 @@ def send_to_slack(csv_file_path):
                     raise  # Re-raise other errors
         
         # If we get here, all channel formats failed
-        print(f"❌ All channel formats failed")
+        if not file_sent:
+            print(f"❌ All channel formats failed")
         return False
         
     except SlackApiError as e:
@@ -858,19 +864,6 @@ def send_to_slack(csv_file_path):
         import traceback
         traceback.print_exc()
         return False
-
-def test_slack_file_upload():
-    """Test function to send CSV file to Slack without running full system"""
-    print("🧪 Testing Slack Bot API file upload...")
-    
-    # Check if CSV exists
-    csv_file = "funding_data.csv"
-    if not os.path.exists(csv_file):
-        print(f"❌ CSV file {csv_file} not found. Run the main script first.")
-        return False
-    
-    # Send the file
-    return send_to_slack(csv_file)
 
 if __name__ == "__main__":
     print("\n" + "#"*60)
