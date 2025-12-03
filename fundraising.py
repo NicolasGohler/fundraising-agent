@@ -13,6 +13,7 @@ MAX_PROJECTS = 15  # Maximum projects to collect from each source (reduced by 10
 # Apollo.io API Configuration
 APOLLO_API_KEY = os.getenv("APOLLO_API_KEY", "oiiVIE2ufVWw3euhP3XLgA")
 APOLLO_API_URL = "https://api.apollo.io/v1/mixed_people/search"
+APOLLO_BULK_ENRICHMENT_URL = "https://api.apollo.io/api/v1/people/bulk_match"
 
 def get_projects_from_cryptorank():
     """Fetch projects from CryptoRank funding rounds"""
@@ -378,6 +379,12 @@ def extract_company_website(project_url):
             browser.close()
             
             if website:
+                # Filter out telegram URLs - they're not valid company websites
+                if 't.me' in website.lower() or 'telegram' in website.lower():
+                    print(f"⚠️  Found telegram URL instead of website: {website}")
+                    print("   Skipping - telegram URLs are not valid for Apollo enrichment")
+                    return None
+                
                 # Clean up the website URL
                 if not website.startswith('http'):
                     website = 'https://' + website
@@ -387,6 +394,13 @@ def extract_company_website(project_url):
                     domain = urlparse(website).netloc
                     if domain.startswith('www.'):
                         domain = domain[4:]
+                    
+                    # Double-check domain is not telegram
+                    if 't.me' in domain.lower() or 'telegram' in domain.lower():
+                        print(f"⚠️  Domain appears to be telegram: {domain}")
+                        print("   Skipping - telegram domains are not valid for Apollo enrichment")
+                        return None
+                    
                     print(f"✅ Successfully found website: {website} (domain: {domain})")
                     return {"website": website, "domain": domain}
                 except:
@@ -473,10 +487,14 @@ def fetch_team_from_apollo(company_name, company_website=None):
                 if linkedin_url and linkedin_url.startswith('http://'):
                     linkedin_url = linkedin_url.replace('http://', 'https://')
                 
+                # Store Apollo person ID for efficient enrichment later
+                apollo_person_id = person.get('id') or person.get('person_id') or person.get('apollo_id')
+                
                 member_data = {
                     "name": name,
                     "role": title if title else None,
                     "linkedin_url": linkedin_url,
+                    "apollo_person_id": apollo_person_id,  # Store for efficient enrichment
                     "source": "apollo_api",
                     "source_url": "https://api.apollo.io/v1/mixed_people/search",
                     "source_type": "people_database",
@@ -485,7 +503,8 @@ def fetch_team_from_apollo(company_name, company_website=None):
                 members.append(member_data)
                 
                 linkedin_str = "with LinkedIn" if linkedin_url else "no LinkedIn"
-                print(f"   ✅ {len(members)}. {name} - {title if title else 'No role'}, {linkedin_str}")
+                id_str = f" (ID: {apollo_person_id})" if apollo_person_id else ""
+                print(f"   ✅ {len(members)}. {name} - {title if title else 'No role'}, {linkedin_str}{id_str}")
             
             print(f"\n✅ Apollo returned {len(members)} team members")
             
@@ -502,6 +521,213 @@ def fetch_team_from_apollo(company_name, company_website=None):
         print(f"   ❌ Error with Apollo API: {str(e)}")
     
     return members
+
+def enrich_people_with_emails(people_with_linkedin):
+    """Enrich people with emails using Apollo bulk enrichment API
+    
+    Uses Apollo person ID when available (for Apollo-sourced data) for better matches.
+    Falls back to LinkedIn URL for scraped data.
+    Filters out telegram URLs to avoid wasting API resources.
+    """
+    if not people_with_linkedin:
+        return {}
+    
+    print(f"\n{'='*60}")
+    print(f"📧 APOLLO BULK ENRICHMENT: Enriching {len(people_with_linkedin)} people with emails")
+    print(f"{'='*60}")
+    
+    # Apollo bulk enrichment supports up to 10 people per request
+    batch_size = 10
+    enrichment_results = {}
+    
+    # Filter out people with invalid URLs (telegram, etc.) before processing
+    valid_people = []
+    skipped_count = 0
+    
+    for person in people_with_linkedin:
+        linkedin_url = person.get('linkedin_url')
+        apollo_person_id = person.get('apollo_person_id')
+        
+        # Skip if no identifier available
+        if not linkedin_url and not apollo_person_id:
+            skipped_count += 1
+            continue
+        
+        # Filter out telegram URLs - they're not valid for enrichment
+        if linkedin_url and ('t.me' in linkedin_url.lower() or 'telegram' in linkedin_url.lower()):
+            print(f"   ⚠️  Skipping {person.get('name', 'Unknown')}: Invalid URL (telegram link)")
+            skipped_count += 1
+            continue
+        
+        valid_people.append(person)
+    
+    if skipped_count > 0:
+        print(f"   ℹ️  Filtered out {skipped_count} invalid entries")
+    
+    if not valid_people:
+        print(f"   ⚠️  No valid people to enrich after filtering")
+        return {}
+    
+    print(f"   ✅ Processing {len(valid_people)} valid people for enrichment")
+    
+    for i in range(0, len(valid_people), batch_size):
+        batch = valid_people[i:i + batch_size]
+        batch_num = (i // batch_size) + 1
+        total_batches = (len(valid_people) + batch_size - 1) // batch_size
+        
+        print(f"\n   Processing batch {batch_num}/{total_batches} ({len(batch)} people)...")
+        
+        # Prepare details array for Apollo API
+        details = []
+        batch_mapping = []  # Store person info for result mapping
+        
+        for person in batch:
+            apollo_person_id = person.get('apollo_person_id')
+            linkedin_url = person.get('linkedin_url')
+            
+            detail = {}
+            
+            # Prefer Apollo person ID for better matches (when available)
+            if apollo_person_id:
+                detail["person_id"] = apollo_person_id
+                print(f"      Using Apollo person ID for {person.get('name', 'Unknown')}")
+            elif linkedin_url:
+                # Fallback to LinkedIn URL for scraped data
+                detail["linkedin_url"] = linkedin_url
+                
+                # Extract name parts if available for better matching
+                name = person.get('name', '')
+                name_parts = name.split() if name else []
+                first_name = name_parts[0] if len(name_parts) > 0 else None
+                last_name = name_parts[-1] if len(name_parts) > 1 else None
+                
+                if first_name:
+                    detail["first_name"] = first_name
+                if last_name and last_name != first_name:
+                    detail["last_name"] = last_name
+                
+                print(f"      Using LinkedIn URL for {person.get('name', 'Unknown')}")
+            else:
+                # Skip if no identifier
+                continue
+            
+            details.append(detail)
+            batch_mapping.append(person)
+        
+        if not details:
+            print(f"   ⚠️  No valid identifiers in batch, skipping...")
+            continue
+        
+        # Prepare API request
+        headers = {
+            "Content-Type": "application/json",
+            "Cache-Control": "no-cache"
+        }
+        
+        payload = {
+            "api_key": APOLLO_API_KEY,
+            "details": details,
+            "reveal_personal_emails": True
+        }
+        
+        try:
+            response = requests.post(APOLLO_BULK_ENRICHMENT_URL, headers=headers, json=payload, timeout=30)
+            
+            if response.status_code == 200:
+                data = response.json()
+                
+                # Apollo API can return matches in different formats
+                # Try 'matches' array first, then 'people' array, then direct array
+                matches = data.get('matches', [])
+                if not matches:
+                    matches = data.get('people', [])
+                if not matches and isinstance(data, list):
+                    matches = data
+                
+                print(f"   ✅ Apollo returned {len(matches)} enriched matches")
+                
+                # Process matches and map back to original people
+                # Match order should correspond to details array order
+                for match_idx, match in enumerate(matches):
+                    if match_idx < len(batch_mapping):
+                        person = batch_mapping[match_idx]
+                        
+                        # Extract email from match - handle different response structures
+                        email = None
+                        
+                        # Try different email field structures
+                        if isinstance(match, dict):
+                            # Direct email field
+                            email = match.get('email')
+                            
+                            # Emails array structure
+                            if not email:
+                                emails = match.get('emails', [])
+                                if emails:
+                                    # Handle array of email strings
+                                    if isinstance(emails[0], str):
+                                        email = emails[0]
+                                    # Handle array of email objects
+                                    elif isinstance(emails[0], dict):
+                                        # Prefer personal email if available
+                                        for email_obj in emails:
+                                            if email_obj.get('type') == 'personal' or not email_obj.get('type'):
+                                                email = email_obj.get('email') or email_obj.get('address')
+                                                break
+                                        # Fallback to first email if no personal email found
+                                        if not email and emails:
+                                            email = emails[0].get('email') or emails[0].get('address')
+                            
+                            # Try personal_email field
+                            if not email:
+                                email = match.get('personal_email')
+                            
+                            # Try work_email field
+                            if not email:
+                                email = match.get('work_email')
+                        
+                        # Store enrichment result using person ID or LinkedIn URL as key
+                        apollo_person_id = person.get('apollo_person_id')
+                        linkedin_url = person.get('linkedin_url')
+                        
+                        # Use person ID as primary key if available, otherwise LinkedIn URL
+                        result_key = apollo_person_id if apollo_person_id else linkedin_url
+                        
+                        if result_key:
+                            enrichment_results[result_key] = {
+                                'email': email,
+                                'person_name': person.get('name'),
+                                'key_type': 'person_id' if apollo_person_id else 'linkedin_url'
+                            }
+                            
+                            if email:
+                                method_str = "person ID" if apollo_person_id else "LinkedIn URL"
+                                print(f"   ✅ {person.get('name', 'Unknown')} ({method_str}): {email}")
+                            else:
+                                print(f"   ⚠️  {person.get('name', 'Unknown')}: No email found")
+                
+            elif response.status_code == 429:
+                print(f"   ⚠️  Rate limit reached on Apollo API, waiting 60 seconds...")
+                time.sleep(60)
+            elif response.status_code == 401:
+                print(f"   ❌ Apollo API authentication failed - check API key")
+                break
+            else:
+                print(f"   ⚠️  Apollo API returned status {response.status_code}: {response.text[:200]}")
+            
+            # Add delay between batches to respect rate limits
+            if i + batch_size < len(people_with_linkedin):
+                time.sleep(2)
+                
+        except requests.exceptions.Timeout:
+            print(f"   ⚠️  Apollo API request timed out")
+        except Exception as e:
+            print(f"   ❌ Error with Apollo bulk enrichment API: {str(e)}")
+            import traceback
+            traceback.print_exc()
+    
+    print(f"\n✅ Bulk enrichment complete: {len(enrichment_results)} people enriched with emails")
+    return enrichment_results
 
 def fetch_team_members(project_url):
     print(f"\n{'='*60}")
@@ -675,6 +901,11 @@ def gather_all():
                                     existing_member['linkedin_url'] = apollo_member['linkedin_url']
                                     print(f"   🔗 Added LinkedIn for {existing_member['name']}")
                                 
+                                # Update Apollo person ID if available (for efficient enrichment)
+                                if apollo_member.get('apollo_person_id') and not existing_member.get('apollo_person_id'):
+                                    existing_member['apollo_person_id'] = apollo_member['apollo_person_id']
+                                    print(f"   🆔 Added Apollo person ID for {existing_member['name']}")
+                                
                                 # Update role if it was missing
                                 if not existing_member.get('role') and apollo_member.get('role'):
                                     existing_member['role'] = apollo_member['role']
@@ -692,6 +923,7 @@ def gather_all():
                 "name": member['name'],
                 "role": member.get('role'),
                 "linkedin_url": member.get('linkedin_url'),
+                "apollo_person_id": member.get('apollo_person_id'),  # Preserve Apollo person ID for efficient enrichment
                 "source": member.get('source', 'cryptorank_team_page'),
                 "source_url": member.get('source_url', ''),
                 "source_type": member.get('source_type', 'project_team_page'),
@@ -735,6 +967,35 @@ def gather_all():
     print(f"   Total people collected: {len(all_people)}")
     print("="*60 + "\n")
     
+    # Enrich people with Apollo person IDs or LinkedIn URLs using Apollo bulk enrichment
+    # Include people with either Apollo person ID (from Apollo API) or LinkedIn URL (from scraping)
+    people_to_enrich = [p for p in all_people if p.get('apollo_person_id') or p.get('linkedin_url')]
+    if people_to_enrich:
+        print(f"\n{'='*60}")
+        print(f"📧 ENRICHMENT PHASE: Enriching {len(people_to_enrich)} people with emails")
+        print(f"{'='*60}\n")
+        
+        enrichment_results = enrich_people_with_emails(people_to_enrich)
+        
+        # Add emails to people records
+        enriched_count = 0
+        for person in all_people:
+            apollo_person_id = person.get('apollo_person_id')
+            linkedin_url = person.get('linkedin_url')
+            
+            # Try person ID first (more efficient), then LinkedIn URL
+            result_key = apollo_person_id if apollo_person_id else linkedin_url
+            
+            if result_key and result_key in enrichment_results:
+                email = enrichment_results[result_key].get('email')
+                if email:
+                    person['email'] = email
+                    enriched_count += 1
+        
+        print(f"\n✅ Enrichment complete: Added emails to {enriched_count} people")
+    else:
+        print(f"\n⚠️  No people with Apollo person IDs or LinkedIn URLs found, skipping email enrichment")
+    
     return all_people
 
 import json
@@ -759,7 +1020,7 @@ def send_error_to_slack(error_message):
         # Send error message
         response = client.chat_postMessage(
             channel=SLACK_CHANNEL,
-            text=f"🚨 Fundraising Scraper Failed: {error_message}"
+            text=f"🚨 Fundraising Agent Failed: {error_message}"
         )
         
         print(f"✅ Error notification sent to Slack!")
@@ -782,7 +1043,7 @@ def send_success_to_slack(people_count, projects_count):
         # Send success message
         response = client.chat_postMessage(
             channel=SLACK_CHANNEL,
-            text=f"✅ Fundraising Scraper Success! Found {people_count} people from {projects_count} projects. Check the uploaded CSV file for details."
+            text=f"✅ Fundraising Agent Success! Found {people_count} people from {projects_count} projects. Check the uploaded CSV file for details."
         )
         
         print(f"✅ Success notification sent to Slack!")
@@ -867,7 +1128,7 @@ def send_to_slack(csv_file_path):
 
 if __name__ == "__main__":
     print("\n" + "#"*60)
-    print("# Crypto Fundraising Team Scraper")
+    print("# Crypto Fundraising Agent")
     print("# Sources: CryptoRank + RootData + Apollo.io")
     print("#"*60)
     

@@ -1,6 +1,6 @@
-# Fundraising Scraper
+# Fundraising Agent
 
-Automated scraper that collects fundraising data from CryptoRank and RootData, extracts team member information, and sends results to Slack.
+Automated agent that collects fundraising data from CryptoRank and RootData, extracts team member information, enriches with email addresses via Apollo.io, and sends results to Slack.
 
 ## Features
 
@@ -71,6 +71,7 @@ Each person record includes:
 - `name`: Person's name
 - `role`: Job title/role
 - `linkedin_url`: LinkedIn profile URL
+- `email`: Email address (enriched via Apollo.io bulk enrichment API)
 - `source`: Data source (e.g., `apollo_api`, `cryptorank_team_page`)
 - `source_url`: URL of the data source
 - `source_type`: Type of source (e.g., `people_database`, `project_team_page`)

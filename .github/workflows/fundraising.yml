@@ -1,4 +1,4 @@
-name: Weekly Fundraising Scraper
+name: Weekly Fundraising Agent
 on:
   schedule:
     - cron: '0 9 * * 1'  # Every Monday at 9 AM UTC
@@ -27,7 +27,7 @@ jobs:
           pip install playwright beautifulsoup4 pandas requests slack-sdk
           playwright install chromium
           
-      - name: Run fundraising scraper
+      - name: Run fundraising agent
         env:
           APOLLO_API_KEY: ${{ secrets.APOLLO_API_KEY }}
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
@@ -42,32 +42,5 @@ jobs:
             funding_data.*
           retention-days: 30
           
-      - name: Upload to Slack
-        if: always()
-        env:
-          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
-        run: |
-          # Find the most recent CSV file
-          CSV_FILE=$(find . -name "funding_data.csv" -type f -exec ls -t {} + | head -n1)
-          if [ -f "$CSV_FILE" ]; then
-            echo "Found CSV file: $CSV_FILE"
-            python -c "
-          import os
-          from slack_sdk import WebClient
-          from slack_sdk.errors import SlackApiError
-          
-          client = WebClient(token=os.environ['SLACK_BOT_TOKEN'])
-          try:
-              response = client.files_upload_v2(
-                  channel='C09CKTZ61DK',
-                  file='$CSV_FILE',
-                  title='🚀 New Fundraising Leads Available',
-                  initial_comment='All these people raised in the past week. Make sure you reach out!'
-              )
-              print('✅ File uploaded to Slack successfully!')
-          except SlackApiError as e:
-              print(f'❌ Slack upload failed: {e}')
-          "
-          else
-            echo "No CSV file found to upload"
-          fi
+      # Note: Slack upload is handled by the Python script itself (send_to_slack function)
+      # No need to upload here to avoid duplicates
