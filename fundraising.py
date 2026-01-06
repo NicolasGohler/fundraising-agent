@@ -16,82 +16,171 @@ APOLLO_API_URL = "https://api.apollo.io/v1/mixed_people/search"
 APOLLO_BULK_ENRICHMENT_URL = "https://api.apollo.io/api/v1/people/bulk_match"
 
 def get_projects_from_cryptorank():
-    """Fetch projects from CryptoRank funding rounds"""
+    """Fetch projects from CryptoRank funding rounds
+
+    Note: CryptoRank uses Cloudflare bot protection which may block automated access.
+    This function implements graceful degradation - if blocked, it returns an empty list
+    and the script continues with other data sources.
+    """
     url = "https://cryptorank.io/funding-rounds"
     print(f"\n{'='*60}")
     print(f"🔍 SOURCE 1: Fetching projects from CryptoRank")
     print(f"{'='*60}")
-    
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_page()
-        
-        print("⏳ Loading page...")
-        page.goto(url, wait_until="networkidle")
-        print("✅ Page loaded successfully")
-        
-        print("⏳ Waiting for table rows to load...")
+
+    try:
+        # Try to import playwright-stealth for better detection evasion
         try:
-            page.wait_for_selector("a[href*='/ico/']", timeout=10000)
-            print("✅ Found project links!")
-        except Exception as e:
-            print(f"⚠️  Timeout waiting for project links: {str(e)}")
-            print("   The page might use different structure")
-        
-        time.sleep(5)
-        print("⏳ Waited additional 5 seconds for complete rendering")
-        
-        print("\n🔍 Searching for project links using Playwright...")
-        project_links = page.locator("a[href*='/ico/']").all()
-        print(f"   Found {len(project_links)} potential project links")
-        
-        projects = []
-        seen_urls = set()
-        max_projects = MAX_PROJECTS
-        
-        for idx, link in enumerate(project_links):
-            if len(projects) >= max_projects:
-                print(f"   ⏸️  Collected {max_projects} projects, stopping collection")
-                break
-            
+            from playwright_stealth import Stealth
+            use_stealth = True
+        except ImportError:
+            use_stealth = False
+
+        with sync_playwright() as p:
+            # Launch browser with anti-detection settings
+            browser = p.chromium.launch(
+                headless=True,
+                args=[
+                    '--disable-blink-features=AutomationControlled',
+                    '--no-sandbox',
+                    '--disable-setuid-sandbox',
+                    '--disable-dev-shm-usage',
+                ]
+            )
+
+            context = browser.new_context(
+                viewport={'width': 1920, 'height': 1080},
+                user_agent='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+                locale='en-US',
+                timezone_id='America/New_York',
+            )
+
+            page = context.new_page()
+
+            # Apply stealth if available
+            if use_stealth:
+                stealth = Stealth()
+                stealth.apply_stealth_sync(page)
+                print("   ℹ️  Using stealth mode")
+
+            # Set longer timeout for page navigation
+            page.set_default_timeout(60000)  # 60 seconds
+
+            print("⏳ Loading page...")
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                    print("✅ Page loaded successfully")
+                    break
+                except Exception as e:
+                    if attempt < max_retries - 1:
+                        wait_time = (attempt + 1) * 5
+                        print(f"⚠️  Attempt {attempt + 1} failed: {str(e)}")
+                        print(f"   Retrying in {wait_time} seconds...")
+                        time.sleep(wait_time)
+                    else:
+                        print(f"❌ All {max_retries} attempts failed: {str(e)}")
+                        browser.close()
+                        return []  # Graceful degradation
+
+            # Wait for potential Cloudflare challenge to resolve
+            print("⏳ Waiting for page to fully render...")
+            time.sleep(10)
+
+            # Check for Cloudflare challenge
+            content = page.content()
+            if "Verify you are human" in content or "Just a moment" in content or "challenge" in content[:2000].lower():
+                print("⚠️  CryptoRank is protected by Cloudflare bot detection")
+                print("   ℹ️  Skipping CryptoRank - will continue with other data sources")
+                browser.close()
+                return []  # Graceful degradation
+
+            print("⏳ Waiting for table rows to load...")
             try:
-                href = link.get_attribute("href")
-                text = link.inner_text()
-                
-                if not href or not text.strip():
-                    continue
-                
-                if not href.startswith("http"):
-                    href = "https://cryptorank.io" + href
-                
-                # Fix: Convert /ico/ URLs to /price/ URLs for proper project page access
-                if '/ico/' in href:
-                    href = href.replace('/ico/', '/price/')
-                    print(f"   🔄 Converted ICO URL to price URL: {href}")
-                
-                if href in seen_urls:
-                    continue
-                
-                seen_urls.add(href)
-                projects.append({
-                    "name": text.strip(), 
-                    "url": href,
-                    "source": "cryptorank_funding_rounds",
-                    "source_url": "https://cryptorank.io/funding-rounds",
-                    "source_type": "funding_platform"
-                })
-                
+                page.wait_for_selector("a[href*='/ico/']", timeout=15000)
+                print("✅ Found project links!")
             except Exception as e:
-                print(f"   ⚠️  Error processing link {idx}: {str(e)}")
-                continue
-        
-        browser.close()
-        
-        print(f"\n{'='*60}")
-        print(f"✅ Total unique projects found: {len(projects)}")
-        print(f"{'='*60}\n")
-        
-        return projects
+                # Try alternative selectors
+                try:
+                    page.wait_for_selector("a[href*='/price/']", timeout=10000)
+                    print("✅ Found project links (via price URLs)!")
+                except:
+                    print(f"⚠️  Timeout waiting for project links")
+                    print("   The page structure may have changed or content is blocked")
+
+            time.sleep(5)
+            print("⏳ Waited additional 5 seconds for complete rendering")
+
+            print("\n🔍 Searching for project links using Playwright...")
+
+            # Try multiple selectors to find project links
+            project_links = page.locator("a[href*='/ico/']").all()
+            if not project_links:
+                project_links = page.locator("a[href*='/price/']").all()
+
+            print(f"   Found {len(project_links)} potential project links")
+
+            # If no links found, check if we're still being blocked
+            if len(project_links) == 0:
+                total_links = len(page.locator("a").all())
+                if total_links < 10:
+                    print("⚠️  Very few links on page - likely still blocked by Cloudflare")
+                    print("   ℹ️  Skipping CryptoRank - will continue with other data sources")
+                    browser.close()
+                    return []  # Graceful degradation
+
+            projects = []
+            seen_urls = set()
+            max_projects = MAX_PROJECTS
+
+            for idx, link in enumerate(project_links):
+                if len(projects) >= max_projects:
+                    print(f"   ⏸️  Collected {max_projects} projects, stopping collection")
+                    break
+
+                try:
+                    href = link.get_attribute("href")
+                    text = link.inner_text()
+
+                    if not href or not text.strip():
+                        continue
+
+                    if not href.startswith("http"):
+                        href = "https://cryptorank.io" + href
+
+                    # Fix: Convert /ico/ URLs to /price/ URLs for proper project page access
+                    if '/ico/' in href:
+                        href = href.replace('/ico/', '/price/')
+                        print(f"   🔄 Converted ICO URL to price URL: {href}")
+
+                    if href in seen_urls:
+                        continue
+
+                    seen_urls.add(href)
+                    projects.append({
+                        "name": text.strip(),
+                        "url": href,
+                        "source": "cryptorank_funding_rounds",
+                        "source_url": "https://cryptorank.io/funding-rounds",
+                        "source_type": "funding_platform"
+                    })
+
+                except Exception as e:
+                    print(f"   ⚠️  Error processing link {idx}: {str(e)}")
+                    continue
+
+            browser.close()
+
+            print(f"\n{'='*60}")
+            print(f"✅ Total unique projects found: {len(projects)}")
+            print(f"{'='*60}\n")
+
+            return projects
+
+    except Exception as e:
+        print(f"❌ CryptoRank scraping failed: {str(e)}")
+        print("   ℹ️  Continuing with other data sources...")
+        return []  # Graceful degradation - return empty list instead of crashing
 
 def get_projects_from_rootdata():
     """Fetch projects from RootData fundraising page"""
@@ -104,9 +193,33 @@ def get_projects_from_rootdata():
         browser = p.chromium.launch(headless=True)
         page = browser.new_page()
         
+        # Set longer timeout for page navigation
+        page.set_default_timeout(60000)  # 60 seconds
+        
         print("⏳ Loading page...")
-        page.goto(url, wait_until="networkidle")
-        print("✅ Page loaded successfully")
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                # Use 'load' instead of 'networkidle' for more reliable loading
+                page.goto(url, wait_until="load", timeout=60000)
+                print("✅ Page loaded successfully")
+                break
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    wait_time = (attempt + 1) * 5
+                    print(f"⚠️  Attempt {attempt + 1} failed: {str(e)}")
+                    print(f"   Retrying in {wait_time} seconds...")
+                    time.sleep(wait_time)
+                else:
+                    print(f"❌ All {max_retries} attempts failed. Trying with 'domcontentloaded' as fallback...")
+                    try:
+                        page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                        print("✅ Page loaded with fallback method")
+                        break
+                    except Exception as e2:
+                        print(f"❌ Fallback also failed: {str(e2)}")
+                        browser.close()
+                        raise Exception(f"Failed to load RootData page after {max_retries} attempts: {str(e2)}")
         
         time.sleep(5)
         print("⏳ Waited 5 seconds for JavaScript to render")
@@ -201,8 +314,12 @@ def extract_company_website(project_url):
         browser = p.chromium.launch(headless=True)
         page = browser.new_page()
         
+        # Set longer timeout for page navigation
+        page.set_default_timeout(60000)  # 60 seconds
+        
         try:
-            page.goto(project_url, wait_until="networkidle", timeout=15000)
+            # Use 'load' instead of 'networkidle' for more reliable loading
+            page.goto(project_url, wait_until="load", timeout=60000)
             print("✅ Main project page loaded")
             
             time.sleep(3)  # Give more time for dynamic content
@@ -345,7 +462,7 @@ def extract_company_website(project_url):
                 
                 # Use longer timeout for RootData pages
                 try:
-                    page.goto(project_url, wait_until="load", timeout=20000)
+                    page.goto(project_url, wait_until="load", timeout=60000)
                     time.sleep(3)
                     html = page.content()
                     soup = BeautifulSoup(html, "html.parser")
@@ -621,11 +738,11 @@ def enrich_people_with_emails(people_with_linkedin):
         # Prepare API request
         headers = {
             "Content-Type": "application/json",
-            "Cache-Control": "no-cache"
+            "Cache-Control": "no-cache",
+            "X-Api-Key": APOLLO_API_KEY
         }
-        
+
         payload = {
-            "api_key": APOLLO_API_KEY,
             "details": details,
             "reveal_personal_emails": True
         }
@@ -744,14 +861,33 @@ def fetch_team_members(project_url):
             team_url = team_url.split('#')[0]
             team_url = team_url.rstrip('/') + '/team'
         
+        # Set longer timeout for page navigation
+        page.set_default_timeout(60000)  # 60 seconds
+        
         print(f"⏳ Loading team page: {team_url}")
-        try:
-            page.goto(team_url, wait_until="networkidle", timeout=15000)
-            print("✅ Team page loaded")
-        except Exception as e:
-            print(f"❌ Error loading team page: {str(e)}")
-            browser.close()
-            return []
+        max_retries = 2
+        for attempt in range(max_retries):
+            try:
+                # Use 'load' instead of 'networkidle' for more reliable loading
+                page.goto(team_url, wait_until="load", timeout=60000)
+                print("✅ Team page loaded")
+                break
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    print(f"⚠️  Attempt {attempt + 1} failed: {str(e)}")
+                    print(f"   Retrying in 5 seconds...")
+                    time.sleep(5)
+                else:
+                    print(f"❌ Error loading team page after {max_retries} attempts: {str(e)}")
+                    # Try fallback with domcontentloaded
+                    try:
+                        page.goto(team_url, wait_until="domcontentloaded", timeout=60000)
+                        print("✅ Team page loaded with fallback method")
+                        break
+                    except Exception as e2:
+                        print(f"❌ Fallback also failed: {str(e2)}")
+                        browser.close()
+                        return []
         
         time.sleep(3)
         print("⏳ Waited 3 seconds for JavaScript to render")
@@ -1005,7 +1141,7 @@ from datetime import datetime
 
 # Slack Configuration
 SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN", "xoxb-5736340339410-9698047778609-dqUa7c0cxcQyM7zdz2bcUPnm")
-SLACK_CHANNEL = os.getenv("SLACK_CHANNEL", "C09CKTZ61DK")
+SLACK_CHANNEL = os.getenv("SLACK_CHANNEL", "C09LV45H77D")
 
 def send_error_to_slack(error_message):
     """Send error notification to Slack"""
