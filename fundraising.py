@@ -12,7 +12,7 @@ MAX_PROJECTS = 15  # Maximum projects to collect from each source (reduced by 10
 
 # Apollo.io API Configuration
 APOLLO_API_KEY = os.getenv("APOLLO_API_KEY", "oiiVIE2ufVWw3euhP3XLgA")
-APOLLO_API_URL = "https://api.apollo.io/v1/mixed_people/search"
+APOLLO_API_URL = "https://api.apollo.io/api/v1/mixed_people/api_search"
 APOLLO_BULK_ENRICHMENT_URL = "https://api.apollo.io/api/v1/people/bulk_match"
 
 def get_projects_from_cryptorank():
@@ -533,110 +533,189 @@ def extract_company_website(project_url):
             return None
 
 def fetch_team_from_apollo(company_name, company_website=None):
-    """Apollo.io API fallback for team members"""
+    """Apollo.io API fallback for team members
+
+    Uses a two-step workflow:
+    1. Search with mixed_people/api_search to get person IDs (returns obfuscated data)
+    2. Enrich with people/bulk_match using IDs to get full profiles (names, LinkedIn, etc.)
+    """
     print(f"\n{'='*60}")
-    print(f"🔍 APOLLO FALLBACK: Searching for {company_name} team on Apollo.io")
+    print(f"🔍 APOLLO: Searching for {company_name} team on Apollo.io")
     print(f"{'='*60}")
-    
+
     clean_name = re.sub(r'\$.*', '', company_name).strip()
     clean_name = re.sub(r'\n.*', '', clean_name).strip()
     print(f"   Cleaned company name: '{clean_name}'")
-    
+
     headers = {
         "Content-Type": "application/json",
         "Cache-Control": "no-cache",
         "X-Api-Key": APOLLO_API_KEY
     }
-    
+
+    # Target executive/leadership titles
     target_titles = [
-        "CEO", "CFO", "COO", "Chief",
-        "Co-Founder", "Founder", "Co Founder",
+        "CEO", "CFO", "COO", "Chief Executive", "Chief Financial", "Chief Operating",
+        "Co-Founder", "Founder", "Co Founder", "Cofounder",
         "VP", "Vice President", "V.P.",
         "Director", "Managing Director",
-        "General Manager", "Growth",
-        "Chief of Staff"
+        "General Manager", "Growth", "Head of",
+        "Chief of Staff", "President"
     ]
-    
-    # Use website domain for more accurate search if available
+
+    # Target seniority levels for better filtering
+    target_seniorities = ["c_suite", "founder", "owner", "vp", "director", "head"]
+
+    # STEP 1: Search for people (returns obfuscated data with IDs)
+    # Use correct Apollo API parameter names (q_organization_domains_list as array)
     if company_website and company_website.get('domain'):
         domain = company_website['domain']
         print(f"   Using website domain for search: '{domain}'")
         payload = {
-            "q_organization_domain": domain,
+            "q_organization_domains_list": [domain],  # Must be array with _list suffix
             "person_titles": target_titles,
+            "person_seniorities": target_seniorities,
             "page": 1,
             "per_page": 25
         }
     else:
         print(f"   Using company name for search: '{clean_name}'")
-    payload = {
-        "q_organization_name": clean_name,
-        "person_titles": target_titles,
-        "page": 1,
-        "per_page": 25
-    }
-    
+        payload = {
+            "q_organization_name": clean_name,
+            "person_titles": target_titles,
+            "person_seniorities": target_seniorities,
+            "page": 1,
+            "per_page": 25
+        }
+
     members = []
-    
+
     try:
+        # Step 1: Search to get person IDs
+        print(f"   📡 Step 1: Searching Apollo database...")
         response = requests.post(APOLLO_API_URL, headers=headers, json=payload, timeout=30)
-        
+
         if response.status_code == 200:
             data = response.json()
             people = data.get('people', [])
-            
-            print(f"   ✅ Apollo found {len(people)} team members")
-            
+
+            print(f"   ✅ Apollo search found {len(people)} potential team members")
+
+            if not people:
+                print(f"   ℹ️  No people found matching criteria")
+                return members
+
+            # Filter out CTOs and collect IDs for enrichment
+            person_ids = []
             for person in people:
-                name = person.get('name')
-                if not name:
+                title = person.get('title', '')
+                if title and ('cto' in title.lower() or 'chief technology' in title.lower() or
+                            'tech' in title.lower() and 'chief' in title.lower()):
                     continue
-                name = name.strip()
-                
-                title = person.get('title')
-                title = title.strip() if title else None
-                
-                # Exclude CTOs
-                if title and ('cto' in title.lower() or 'chief technology' in title.lower()):
-                    continue
-                
-                linkedin_url = person.get('linkedin_url')
-                if linkedin_url and linkedin_url.startswith('http://'):
-                    linkedin_url = linkedin_url.replace('http://', 'https://')
-                
-                # Store Apollo person ID for efficient enrichment later
-                apollo_person_id = person.get('id') or person.get('person_id') or person.get('apollo_id')
-                
-                member_data = {
-                    "name": name,
-                    "role": title if title else None,
-                    "linkedin_url": linkedin_url,
-                    "apollo_person_id": apollo_person_id,  # Store for efficient enrichment
-                    "source": "apollo_api",
-                    "source_url": "https://api.apollo.io/v1/mixed_people/search",
-                    "source_type": "people_database",
-                    "apollo_search_method": "domain" if company_website and company_website.get('domain') else "company_name"
-                }
-                members.append(member_data)
-                
-                linkedin_str = "with LinkedIn" if linkedin_url else "no LinkedIn"
-                id_str = f" (ID: {apollo_person_id})" if apollo_person_id else ""
-                print(f"   ✅ {len(members)}. {name} - {title if title else 'No role'}, {linkedin_str}{id_str}")
-            
-            print(f"\n✅ Apollo returned {len(members)} team members")
-            
+                person_id = person.get('id')
+                if person_id:
+                    person_ids.append(person_id)
+
+            if not person_ids:
+                print(f"   ℹ️  No eligible people after filtering CTOs")
+                return members
+
+            print(f"   ✅ {len(person_ids)} people eligible for enrichment (after excluding CTOs)")
+
+            # Step 2: Enrich in batches of 10 (Apollo limit)
+            print(f"   📡 Step 2: Enriching profiles to get full data...")
+            enriched_count = 0
+
+            for i in range(0, len(person_ids), 10):
+                batch_ids = person_ids[i:i+10]
+                details = [{"id": pid} for pid in batch_ids]
+
+                enrich_payload = {"details": details}
+
+                try:
+                    enrich_response = requests.post(
+                        APOLLO_BULK_ENRICHMENT_URL,
+                        headers=headers,
+                        json=enrich_payload,
+                        timeout=30
+                    )
+
+                    if enrich_response.status_code == 200:
+                        enrich_data = enrich_response.json()
+                        matches = enrich_data.get('matches', [])
+
+                        for person in matches:
+                            # Get full name from enriched data
+                            name = person.get('name')
+                            if not name:
+                                first_name = person.get('first_name', '')
+                                last_name = person.get('last_name', '')
+                                name = f"{first_name} {last_name}".strip()
+
+                            if not name:
+                                continue
+
+                            title = person.get('title')
+                            title = title.strip() if title else None
+
+                            # Skip CTOs that might have slipped through
+                            if title and ('cto' in title.lower() or 'chief technology' in title.lower()):
+                                continue
+
+                            linkedin_url = person.get('linkedin_url')
+                            if linkedin_url and linkedin_url.startswith('http://'):
+                                linkedin_url = linkedin_url.replace('http://', 'https://')
+
+                            apollo_person_id = person.get('id')
+                            email = person.get('email')
+
+                            member_data = {
+                                "name": name,
+                                "role": title,
+                                "linkedin_url": linkedin_url,
+                                "email": email,
+                                "apollo_person_id": apollo_person_id,
+                                "source": "apollo_api",
+                                "source_url": APOLLO_API_URL,
+                                "source_type": "people_database",
+                                "apollo_search_method": "domain" if company_website and company_website.get('domain') else "company_name"
+                            }
+                            members.append(member_data)
+                            enriched_count += 1
+
+                            linkedin_str = "with LinkedIn" if linkedin_url else "no LinkedIn"
+                            email_str = f", email: {email}" if email else ""
+                            print(f"   ✅ {enriched_count}. {name} - {title if title else 'No role'}, {linkedin_str}{email_str}")
+
+                    elif enrich_response.status_code == 429:
+                        print(f"   ⚠️  Rate limit reached during enrichment, returning partial results")
+                        break
+                    else:
+                        print(f"   ⚠️  Enrichment batch failed with status {enrich_response.status_code}")
+
+                except requests.exceptions.Timeout:
+                    print(f"   ⚠️  Enrichment request timed out")
+                except Exception as e:
+                    print(f"   ⚠️  Enrichment error: {str(e)}")
+
+            print(f"\n✅ Apollo returned {len(members)} enriched team members")
+
         elif response.status_code == 429:
             print(f"   ⚠️  Rate limit reached on Apollo API")
         elif response.status_code == 401:
             print(f"   ❌ Apollo API authentication failed - check API key")
         else:
             print(f"   ⚠️  Apollo API returned status {response.status_code}")
-            
+            try:
+                print(f"   📝 Response: {response.text[:300]}")
+            except:
+                pass
+
     except requests.exceptions.Timeout:
         print(f"   ⚠️  Apollo API request timed out")
     except Exception as e:
         print(f"   ❌ Error with Apollo API: {str(e)}")
-    
+
     return members
 
 def enrich_people_with_emails(people_with_linkedin):
@@ -706,7 +785,7 @@ def enrich_people_with_emails(people_with_linkedin):
             
             # Prefer Apollo person ID for better matches (when available)
             if apollo_person_id:
-                detail["person_id"] = apollo_person_id
+                detail["id"] = apollo_person_id  # Apollo API uses 'id' not 'person_id'
                 print(f"      Using Apollo person ID for {person.get('name', 'Unknown')}")
             elif linkedin_url:
                 # Fallback to LinkedIn URL for scraped data
