@@ -605,12 +605,36 @@ def fetch_team_from_apollo(company_name, company_website=None):
                 print(f"   ℹ️  No people found matching criteria")
                 return members
 
-            # Filter out CTOs and collect IDs for enrichment
+            # Filter out non-target roles - collect IDs for enrichment
             person_ids = []
+            excluded_roles = {
+                # CTO/Tech/Engineering roles
+                'cto', 'chief technology', 'tech lead', 'engineer', 'engineering',
+                'developer', 'software', 'backend', 'frontend', 'full stack', 'fullstack',
+                'devops', 'sre', 'infrastructure', 'architect', 'technical',
+                # HR roles
+                'hr', 'human resource', 'people operations', 'people ops', 'talent',
+                'recruiting', 'recruiter', 'recruitment', 'hiring',
+                # Trading roles
+                'trader', 'trading', 'quant', 'quantitative', 'portfolio manager',
+                'market maker', 'market making', 'derivatives', 'prop trading',
+                # Sales roles
+                'sales', 'account executive', 'account manager', 'business development',
+                'bdr', 'sdr', 'revenue', 'partnerships', 'partner manager',
+                # Product roles
+                'product', 'product manager', 'product owner', 'product lead', 'cpo',
+                'chief product', 'product director', 'product head'
+            }
             for person in people:
                 title = person.get('title', '')
-                if title and ('cto' in title.lower() or 'chief technology' in title.lower() or
-                            'tech' in title.lower() and 'chief' in title.lower()):
+                title_lower = title.lower() if title else ''
+
+                # Skip if title matches any excluded role
+                if title_lower and any(excluded in title_lower for excluded in excluded_roles):
+                    continue
+                # Also skip CTO variations
+                if title_lower and ('cto' in title_lower or 'chief technology' in title_lower or
+                            ('tech' in title_lower and 'chief' in title_lower)):
                     continue
                 person_id = person.get('id')
                 if person_id:
@@ -657,9 +681,12 @@ def fetch_team_from_apollo(company_name, company_website=None):
 
                             title = person.get('title')
                             title = title.strip() if title else None
+                            title_lower = title.lower() if title else ''
 
-                            # Skip CTOs that might have slipped through
-                            if title and ('cto' in title.lower() or 'chief technology' in title.lower()):
+                            # Skip CTOs, HR, and trading roles that might have slipped through
+                            if title_lower and any(excluded in title_lower for excluded in excluded_roles):
+                                continue
+                            if title_lower and ('cto' in title_lower or 'chief technology' in title_lower):
                                 continue
 
                             linkedin_url = person.get('linkedin_url')
@@ -1012,8 +1039,21 @@ def fetch_team_members(project_url):
                                     linkedin_url = href
                                     break
                 
-                # Exclude CTOs
-                if role and ('cto' in role.lower() or 'chief technology' in role.lower()):
+                # Exclude non-target roles
+                excluded_keywords = [
+                    'cto', 'chief technology', 'tech lead', 'engineer', 'engineering',
+                    'developer', 'software', 'backend', 'frontend', 'full stack', 'fullstack',
+                    'devops', 'sre', 'infrastructure', 'architect', 'technical',
+                    'hr', 'human resource', 'people operations', 'people ops', 'talent',
+                    'recruiting', 'recruiter', 'recruitment', 'hiring',
+                    'trader', 'trading', 'quant', 'quantitative', 'portfolio manager',
+                    'market maker', 'market making', 'derivatives', 'prop trading',
+                    'sales', 'account executive', 'account manager', 'business development',
+                    'bdr', 'sdr', 'revenue', 'partnerships', 'partner manager',
+                    'product', 'product manager', 'product owner', 'product lead', 'cpo',
+                    'chief product', 'product director', 'product head'
+                ]
+                if role and any(kw in role.lower() for kw in excluded_keywords):
                     continue
                 
                 member_data = {
@@ -1100,9 +1140,24 @@ def gather_all():
             if apollo_team:
                 existing_names = {m['name'].lower() for m in team}
                 
+                # Roles to exclude from results
+                excluded_role_keywords = [
+                    'cto', 'chief technology', 'tech lead', 'engineer', 'engineering',
+                    'developer', 'software', 'backend', 'frontend', 'full stack', 'fullstack',
+                    'devops', 'sre', 'infrastructure', 'architect', 'technical',
+                    'hr', 'human resource', 'people operations', 'people ops', 'talent',
+                    'recruiting', 'recruiter', 'recruitment', 'hiring',
+                    'trader', 'trading', 'quant', 'quantitative', 'portfolio manager',
+                    'market maker', 'market making', 'derivatives', 'prop trading',
+                    'sales', 'account executive', 'account manager', 'business development',
+                    'bdr', 'sdr', 'revenue', 'partnerships', 'partner manager',
+                    'product', 'product manager', 'product owner', 'product lead', 'cpo',
+                    'chief product', 'product director', 'product head'
+                ]
                 for apollo_member in apollo_team:
                     apollo_role = apollo_member.get('role', '')
-                    if apollo_role and ('cto' in apollo_role.lower() or 'chief technology' in apollo_role.lower()):
+                    role_lower = apollo_role.lower() if apollo_role else ''
+                    if role_lower and any(excluded in role_lower for excluded in excluded_role_keywords):
                         continue
                     
                     if apollo_member['name'].lower() not in existing_names:
