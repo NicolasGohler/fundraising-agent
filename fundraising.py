@@ -1,5 +1,8 @@
 from playwright.sync_api import sync_playwright
 from bs4 import BeautifulSoup
+from telethon.sync import TelegramClient
+from telethon.sessions import StringSession
+from telethon.tl.types import User
 import time
 import requests
 import re
@@ -14,6 +17,11 @@ MAX_PROJECTS = 15  # Maximum projects to collect from each source (reduced by 10
 APOLLO_API_KEY = os.getenv("APOLLO_API_KEY", "oiiVIE2ufVWw3euhP3XLgA")
 APOLLO_API_URL = "https://api.apollo.io/api/v1/mixed_people/api_search"
 APOLLO_BULK_ENRICHMENT_URL = "https://api.apollo.io/api/v1/people/bulk_match"
+
+# Telegram API Configuration
+TELEGRAM_API_ID = 33516003
+TELEGRAM_API_HASH = "e55fb2c7bcad95849e4520ca89bdd72b"
+TELEGRAM_SESSION = "1AZWarzsBu0I8ILcKvEtUX7RmFHA42OGBzj7lK_QHb4ed6EzTfl7_d8SbXvE4RuigY5CtuXOFUixaHWGfB8j-MosgsWALkYaZMd7ZD17BILgHefiutAbImCYK3M_LhXK-fkxiwRbrugCDW8u5ssZ9qmdo6mq6zvhNYH57kZjLkTikGxn1B3YG255blRbjYtujBiKY1KdT5HV9RdBUTdooghqOoFvMP_yBV9d6uaibE3qRrlEEEf8iqTNrJkXCUxgmKTgd2LfLPGtyMZgU9n16PHMS-LOqHNjnmQ3xnigY6FsAxGDTBej8mBYT5PFNrx6VGfN4EsnP_ZO8KDn28oCnocQ9eSmKF3M="
 
 def get_projects_from_cryptorank():
     """Fetch projects from CryptoRank funding rounds
@@ -693,6 +701,8 @@ def fetch_team_from_apollo(company_name, company_website=None):
                             if linkedin_url and linkedin_url.startswith('http://'):
                                 linkedin_url = linkedin_url.replace('http://', 'https://')
 
+                            twitter_url = person.get('twitter_url')
+
                             apollo_person_id = person.get('id')
                             email = person.get('email')
 
@@ -700,19 +710,19 @@ def fetch_team_from_apollo(company_name, company_website=None):
                                 "name": name,
                                 "role": title,
                                 "linkedin_url": linkedin_url,
+                                "twitter_url": twitter_url,
                                 "email": email,
                                 "apollo_person_id": apollo_person_id,
                                 "source": "apollo_api",
-                                "source_url": APOLLO_API_URL,
-                                "source_type": "people_database",
-                                "apollo_search_method": "domain" if company_website and company_website.get('domain') else "company_name"
+                                "source_url": APOLLO_API_URL
                             }
                             members.append(member_data)
                             enriched_count += 1
 
                             linkedin_str = "with LinkedIn" if linkedin_url else "no LinkedIn"
+                            twitter_str = f", Twitter: {twitter_url}" if twitter_url else ""
                             email_str = f", email: {email}" if email else ""
-                            print(f"   ✅ {enriched_count}. {name} - {title if title else 'No role'}, {linkedin_str}{email_str}")
+                            print(f"   ✅ {enriched_count}. {name} - {title if title else 'No role'}, {linkedin_str}{twitter_str}{email_str}")
 
                     elif enrich_response.status_code == 429:
                         print(f"   ⚠️  Rate limit reached during enrichment, returning partial results")
@@ -1020,24 +1030,26 @@ def fetch_team_members(project_url):
                 parent = name_tag.find_parent()
                 role = None
                 linkedin_url = None
-                
+                twitter_url = None
+
                 if parent:
                     next_p = name_tag.find_next_sibling('p')
                     if next_p:
                         potential_role = next_p.get_text(strip=True)
                         if potential_role and len(potential_role) < 50 and not name_pattern.match(potential_role):
                             role = potential_role
-                    
-                    # Find LinkedIn URL in great-grandparent container
+
+                    # Find LinkedIn and Twitter URLs in great-grandparent container
                     grandparent = parent.find_parent()
                     if grandparent:
                         great_grandparent = grandparent.find_parent()
                         if great_grandparent:
                             for a in great_grandparent.find_all('a', href=True):
                                 href = a['href']
-                                if 'linkedin.com' in href.lower():
+                                if not linkedin_url and 'linkedin.com' in href.lower():
                                     linkedin_url = href
-                                    break
+                                elif not twitter_url and ('twitter.com' in href.lower() or 'x.com' in href.lower()):
+                                    twitter_url = href
                 
                 # Exclude non-target roles
                 excluded_keywords = [
@@ -1060,14 +1072,15 @@ def fetch_team_members(project_url):
                     "name": name,
                     "role": role,
                     "linkedin_url": linkedin_url,
+                    "twitter_url": twitter_url,
                     "source": "cryptorank_team_page",
-                    "source_url": team_url,
-                    "source_type": "project_team_page"
+                    "source_url": team_url
                 }
                 members.append(member_data)
-                
+
                 linkedin_str = "with LinkedIn" if linkedin_url else "no LinkedIn"
-                print(f"   ✅ {len(members)}. {name} - {role if role else 'No role found'}, {linkedin_str}")
+                twitter_str = "with Twitter" if twitter_url else "no Twitter"
+                print(f"   ✅ {len(members)}. {name} - {role if role else 'No role found'}, {linkedin_str}, {twitter_str}")
         
         except Exception as e:
             print(f"❌ Error parsing team members: {str(e)}")
@@ -1078,6 +1091,71 @@ def fetch_team_members(project_url):
         
         print(f"\n✅ Total team members found: {len(members)}")
         return members
+
+def extract_twitter_username(twitter_url):
+    """Extract username from a Twitter/X URL"""
+    if not twitter_url:
+        return None
+    url = twitter_url.strip().rstrip('/')
+    # Handle twitter.com/username and x.com/username
+    match = re.search(r'(?:twitter\.com|x\.com)/(@?[\w]+)', url, re.IGNORECASE)
+    if match:
+        username = match.group(1).lstrip('@')
+        # Skip non-profile paths
+        if username.lower() in ('home', 'explore', 'search', 'settings', 'i', 'intent', 'share'):
+            return None
+        return username
+    return None
+
+def resolve_telegram_usernames(people):
+    """Check if Twitter usernames exist on Telegram and add telegram_username field"""
+    # Build mapping: username -> list of person dicts that share it
+    username_to_people = {}
+    for person in people:
+        username = extract_twitter_username(person.get('twitter_url'))
+        if username:
+            username_to_people.setdefault(username, []).append(person)
+
+    if not username_to_people:
+        print("   No Twitter usernames to check")
+        return
+
+    unique_usernames = list(username_to_people.keys())
+    print(f"   Checking {len(unique_usernames)} unique Twitter usernames on Telegram...")
+
+    resolved_count = 0
+    try:
+        client = TelegramClient(StringSession(TELEGRAM_SESSION), TELEGRAM_API_ID, TELEGRAM_API_HASH)
+        client.connect()
+
+        if not client.is_user_authorized():
+            print("   ❌ Telegram session is not authorized, skipping resolution")
+            client.disconnect()
+            return
+
+        for i, username in enumerate(unique_usernames):
+            try:
+                entity = client.get_entity(username)
+                if isinstance(entity, User):
+                    resolved_count += 1
+                    tg_username = f"@{entity.username}" if entity.username else f"@{username}"
+                    for person in username_to_people[username]:
+                        person['telegram_username'] = tg_username
+                    print(f"   ✅ {username} → Telegram user found: {tg_username}")
+                else:
+                    print(f"   ⏭️  {username} → exists on Telegram but is not a user (channel/group)")
+            except Exception:
+                print(f"   ❌ {username} → not found on Telegram")
+
+            # Rate limit: 1 second between lookups
+            if i < len(unique_usernames) - 1:
+                time.sleep(1)
+
+        client.disconnect()
+    except Exception as e:
+        print(f"   ❌ Telegram connection error: {str(e)}")
+
+    print(f"\n   ✅ Telegram resolution complete: {resolved_count}/{len(unique_usernames)} usernames found")
 
 def gather_all():
     """Main function to gather all team members from all sources"""
@@ -1171,6 +1249,11 @@ def gather_all():
                                     existing_member['linkedin_url'] = apollo_member['linkedin_url']
                                     print(f"   🔗 Added LinkedIn for {existing_member['name']}")
                                 
+                                # Update Twitter if Apollo has it and member doesn't
+                                if not existing_member.get('twitter_url') and apollo_member.get('twitter_url'):
+                                    existing_member['twitter_url'] = apollo_member['twitter_url']
+                                    print(f"   🐦 Added Twitter for {existing_member['name']}")
+
                                 # Update Apollo person ID if available (for efficient enrichment)
                                 if apollo_member.get('apollo_person_id') and not existing_member.get('apollo_person_id'):
                                     existing_member['apollo_person_id'] = apollo_member['apollo_person_id']
@@ -1193,18 +1276,14 @@ def gather_all():
                 "name": member['name'],
                 "role": member.get('role'),
                 "linkedin_url": member.get('linkedin_url'),
-                "apollo_person_id": member.get('apollo_person_id'),  # Preserve Apollo person ID for efficient enrichment
+                "twitter_url": member.get('twitter_url'),
+                "apollo_person_id": member.get('apollo_person_id'),
                 "source": member.get('source', 'cryptorank_team_page'),
                 "source_url": member.get('source_url', ''),
-                "source_type": member.get('source_type', 'project_team_page'),
-                "apollo_search_method": member.get('apollo_search_method', ''),
                 "project": project['name'],
                 "project_url": project['url'],
-                "project_source": project.get('source', 'cryptorank_funding_rounds'),
                 "project_source_url": project.get('source_url', 'https://cryptorank.io/funding-rounds'),
-                "project_source_type": project.get('source_type', 'funding_platform'),
-                "company_website": website_info['website'] if website_info else None,
-                "company_domain": website_info['domain'] if website_info else None
+                "company_website": website_info['website'] if website_info else None
             }
             all_people.append(person_entry)
         
@@ -1217,15 +1296,10 @@ def gather_all():
                 "linkedin_url": None,
                 "source": "project_only",
                 "source_url": "",
-                "source_type": "project_data_only",
-                "apollo_search_method": "",
                 "project": project['name'],
                 "project_url": project['url'],
-                "project_source": project.get('source', 'cryptorank_funding_rounds'),
                 "project_source_url": project.get('source_url', 'https://cryptorank.io/funding-rounds'),
-                "project_source_type": project.get('source_type', 'funding_platform'),
-                "company_website": website_info['website'] if website_info else None,
-                "company_domain": website_info['domain'] if website_info else None
+                "company_website": website_info['website'] if website_info else None
             }
             all_people.append(person_entry)
         
@@ -1265,7 +1339,17 @@ def gather_all():
         print(f"\n✅ Enrichment complete: Added emails to {enriched_count} people")
     else:
         print(f"\n⚠️  No people with Apollo person IDs or LinkedIn URLs found, skipping email enrichment")
-    
+
+    # Telegram username resolution phase
+    people_with_twitter = [p for p in all_people if p.get('twitter_url')]
+    if people_with_twitter:
+        print(f"\n{'='*60}")
+        print(f"📱 TELEGRAM PHASE: Checking {len(people_with_twitter)} Twitter usernames on Telegram")
+        print(f"{'='*60}\n")
+        resolve_telegram_usernames(all_people)
+    else:
+        print(f"\n⚠️  No people with Twitter URLs found, skipping Telegram resolution")
+
     return all_people
 
 import json
