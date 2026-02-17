@@ -294,8 +294,18 @@ def get_all_projects():
         clean_name = re.sub(r'\n.*', '', project['name']).strip()
         clean_name = re.sub(r'\$.*', '', clean_name).strip()
         name_key = clean_name.lower()
-        
-        if name_key not in seen_names and len(clean_name) > 1:
+
+        if len(clean_name) <= 1:
+            continue
+
+        # Check for exact match or prefix/substring overlap (handles "LayerZero" vs "LayerZeroZRO")
+        is_duplicate = False
+        for seen in seen_names:
+            if name_key == seen or name_key.startswith(seen) or seen.startswith(name_key):
+                is_duplicate = True
+                break
+
+        if not is_duplicate:
             seen_names.add(name_key)
             all_projects.append({
                 "name": clean_name,
@@ -1190,36 +1200,33 @@ def gather_all():
         print(f"{'='*60}")
         
         team = []
-        
+
         # Extract company website first
         website_info = extract_company_website(project['url'])
-        
-        # Use Apollo directly when website found to save resources
         if website_info and website_info.get('domain'):
-            print(f"   ✅ Website found! Using Apollo with domain: {website_info['domain']}")
-            team = []
+            print(f"   ✅ Website found: {website_info['website']} (domain: {website_info['domain']})")
+        else:
+            print("   ⚠️  No website found")
+
+        # Always scrape CryptoRank team page for CryptoRank projects
+        if project['source'] == 'cryptorank_funding_rounds':
+            team = fetch_team_members(project['url'])
+        else:
+            print("   ℹ️  RootData project - skipping team page, will use Apollo")
+
+        # Use Apollo to supplement: fill missing LinkedIn/Twitter, add extra members
+        should_use_apollo = False
+        if not team:
+            print("   ⚠️  No team members found - will try Apollo")
             should_use_apollo = True
         else:
-            # Fallback to original method if no website found
-            print("   ⚠️  No website found, using fallback method")
-            
-            # Only try CryptoRank team page if project is from CryptoRank
-            if project['source'] == 'cryptorank_funding_rounds':
-                team = fetch_team_members(project['url'])
-            else:
-                print("   ℹ️  RootData project - skipping team page, will use Apollo")
-            
-            # Determine if Apollo is needed
-            should_use_apollo = False
-            
-            if not team:
-                print("   ⚠️  No team members found - will try Apollo")
+            members_without_linkedin = [m for m in team if not m.get('linkedin_url')]
+            if members_without_linkedin:
+                print(f"   ⚠️  {len(members_without_linkedin)} team member(s) have no LinkedIn - will try Apollo")
                 should_use_apollo = True
-            else:
-                members_without_linkedin = [m for m in team if not m.get('linkedin_url')]
-                if members_without_linkedin:
-                    print(f"   ⚠️  {len(members_without_linkedin)} team member(s) have no LinkedIn - will try Apollo")
-                    should_use_apollo = True
+            elif website_info and website_info.get('domain'):
+                print(f"   ℹ️  Will also check Apollo for additional team members")
+                should_use_apollo = True
         
         # Apollo search
         if should_use_apollo:
@@ -1264,6 +1271,11 @@ def gather_all():
                                 if not existing_member.get('twitter_url') and apollo_member.get('twitter_url'):
                                     existing_member['twitter_url'] = apollo_member['twitter_url']
                                     print(f"   🐦 Added Twitter for {existing_member['name']}")
+
+                                # Update email if Apollo has it and member doesn't
+                                if not existing_member.get('email') and apollo_member.get('email'):
+                                    existing_member['email'] = apollo_member['email']
+                                    print(f"   📧 Added email for {existing_member['name']}")
 
                                 # Update Apollo person ID if available (for efficient enrichment)
                                 if apollo_member.get('apollo_person_id') and not existing_member.get('apollo_person_id'):
@@ -1322,34 +1334,22 @@ def gather_all():
     print(f"   Total people collected: {len(all_people)}")
     print("="*60 + "\n")
     
-    # Enrich people with Apollo person IDs or LinkedIn URLs using Apollo bulk enrichment
-    # Include people with either Apollo person ID (from Apollo API) or LinkedIn URL (from scraping)
-    people_to_enrich = [p for p in all_people if p.get('apollo_person_id') or p.get('linkedin_url')]
-    if people_to_enrich:
-        print(f"\n{'='*60}")
-        print(f"📧 ENRICHMENT PHASE: Enriching {len(people_to_enrich)} people with emails")
-        print(f"{'='*60}\n")
-        
-        enrichment_results = enrich_people_with_emails(people_to_enrich)
-        
-        # Add emails to people records
-        enriched_count = 0
-        for person in all_people:
-            apollo_person_id = person.get('apollo_person_id')
-            linkedin_url = person.get('linkedin_url')
-            
-            # Try person ID first (more efficient), then LinkedIn URL
-            result_key = apollo_person_id if apollo_person_id else linkedin_url
-            
-            if result_key and result_key in enrichment_results:
-                email = enrichment_results[result_key].get('email')
-                if email:
-                    person['email'] = email
-                    enriched_count += 1
-        
-        print(f"\n✅ Enrichment complete: Added emails to {enriched_count} people")
-    else:
-        print(f"\n⚠️  No people with Apollo person IDs or LinkedIn URLs found, skipping email enrichment")
+    # Email enrichment disabled — outreach is done via Telegram and LinkedIn,
+    # so spending Apollo credits on emails is unnecessary for now.
+    # To re-enable, uncomment the block below.
+    #
+    # people_to_enrich = [p for p in all_people if p.get('apollo_person_id') or p.get('linkedin_url')]
+    # if people_to_enrich:
+    #     enrichment_results = enrich_people_with_emails(people_to_enrich)
+    #     enriched_count = 0
+    #     for person in all_people:
+    #         result_key = person.get('apollo_person_id') or person.get('linkedin_url')
+    #         if result_key and result_key in enrichment_results:
+    #             email = enrichment_results[result_key].get('email')
+    #             if email:
+    #                 person['email'] = email
+    #                 enriched_count += 1
+    #     print(f"\n✅ Enrichment complete: Added emails to {enriched_count} people")
 
     # Telegram username resolution phase
     people_with_twitter = [p for p in all_people if p.get('twitter_url')]
@@ -1529,6 +1529,16 @@ if __name__ == "__main__":
             else:
                 print(f"   ⚠️  No role column found in data")
             
+            # Order columns so telegram_username sits next to twitter_url
+            preferred_order = [
+                'name', 'role', 'linkedin_url', 'twitter_url', 'telegram_username',
+                'email', 'apollo_person_id', 'source', 'source_url',
+                'project', 'project_url', 'project_source_url', 'company_website'
+            ]
+            ordered_cols = [c for c in preferred_order if c in df.columns]
+            ordered_cols += [c for c in df.columns if c not in ordered_cols]
+            df = df[ordered_cols]
+
             csv_filename = os.path.join(folder_name, "funding_data.csv")
             df.to_csv(csv_filename, index=False)
             print(f"✅ CSV saved: {csv_filename}")
