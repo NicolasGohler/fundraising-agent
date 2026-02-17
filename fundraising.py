@@ -1015,59 +1015,70 @@ def fetch_team_members(project_url):
         members = []
         
         try:
-            # Team member names are in <p> tags with 'bvzmmt' class
-            name_tags = soup.find_all('p', class_=lambda x: x and 'bvzmmt' in x)
-            print(f"   Found {len(name_tags)} potential team member elements")
-            
             name_pattern = re.compile(r'^[A-Z][a-z]+(\s+[A-Z][a-z]+){1,3}$')
-            
+
+            # Find name tags using CSS module class prefix (stable across deployments)
+            name_tags = soup.find_all('p', class_=lambda x: x and any('styles_name__' in c for c in (x if isinstance(x, list) else [x])))
+            print(f"   Found {len(name_tags)} team member elements")
+
+            excluded_keywords = [
+                'cto', 'chief technology', 'tech lead', 'engineer', 'engineering',
+                'developer', 'software', 'backend', 'frontend', 'full stack', 'fullstack',
+                'devops', 'sre', 'infrastructure', 'architect', 'technical',
+                'hr', 'human resource', 'people operations', 'people ops', 'talent',
+                'recruiting', 'recruiter', 'recruitment', 'hiring',
+                'trader', 'trading', 'quant', 'quantitative', 'portfolio manager',
+                'market maker', 'market making', 'derivatives', 'prop trading',
+                'sales', 'account executive', 'account manager', 'business development',
+                'bdr', 'sdr', 'revenue', 'partnerships', 'partner manager',
+                'product', 'product manager', 'product owner', 'product lead', 'cpo',
+                'chief product', 'product director', 'product head'
+            ]
+
             for name_tag in name_tags:
                 name = name_tag.get_text(strip=True)
-                
+
                 if not name_pattern.match(name):
                     continue
-                
-                parent = name_tag.find_parent()
+
                 role = None
                 linkedin_url = None
                 twitter_url = None
 
-                if parent:
-                    next_p = name_tag.find_next_sibling('p')
-                    if next_p:
-                        potential_role = next_p.get_text(strip=True)
-                        if potential_role and len(potential_role) < 50 and not name_pattern.match(potential_role):
-                            role = potential_role
+                # Find the card container (parent div with styles_container__ class)
+                card = name_tag.find_parent('div', class_=lambda x: x and any('styles_container__' in c for c in (x if isinstance(x, list) else [x])))
+                if not card:
+                    # Fallback: walk up to great-grandparent
+                    card = name_tag.find_parent()
+                    if card:
+                        card = card.find_parent()
+                    if card:
+                        card = card.find_parent()
 
-                    # Find LinkedIn and Twitter URLs in great-grandparent container
-                    grandparent = parent.find_parent()
-                    if grandparent:
-                        great_grandparent = grandparent.find_parent()
-                        if great_grandparent:
-                            for a in great_grandparent.find_all('a', href=True):
-                                href = a['href']
-                                if not linkedin_url and 'linkedin.com' in href.lower():
-                                    linkedin_url = href
-                                elif not twitter_url and ('twitter.com' in href.lower() or 'x.com' in href.lower()):
-                                    twitter_url = href
-                
-                # Exclude non-target roles
-                excluded_keywords = [
-                    'cto', 'chief technology', 'tech lead', 'engineer', 'engineering',
-                    'developer', 'software', 'backend', 'frontend', 'full stack', 'fullstack',
-                    'devops', 'sre', 'infrastructure', 'architect', 'technical',
-                    'hr', 'human resource', 'people operations', 'people ops', 'talent',
-                    'recruiting', 'recruiter', 'recruitment', 'hiring',
-                    'trader', 'trading', 'quant', 'quantitative', 'portfolio manager',
-                    'market maker', 'market making', 'derivatives', 'prop trading',
-                    'sales', 'account executive', 'account manager', 'business development',
-                    'bdr', 'sdr', 'revenue', 'partnerships', 'partner manager',
-                    'product', 'product manager', 'product owner', 'product lead', 'cpo',
-                    'chief product', 'product director', 'product head'
-                ]
+                if card:
+                    # Extract role from badge button or span
+                    badge = card.find('button', class_=lambda x: x and any('styles_badge_root__' in c for c in (x if isinstance(x, list) else [x])))
+                    if badge:
+                        role = badge.get_text(strip=True)
+                    else:
+                        # Fallback: look for next sibling <p> (old layout)
+                        next_p = name_tag.find_next_sibling('p')
+                        if next_p:
+                            potential_role = next_p.get_text(strip=True)
+                            if potential_role and len(potential_role) < 50 and not name_pattern.match(potential_role):
+                                role = potential_role
+
+                    # Extract social links from the card container
+                    for a in card.find_all('a', href=True):
+                        href = a['href']
+                        if not linkedin_url and 'linkedin.com' in href.lower():
+                            linkedin_url = href
+                        elif not twitter_url and ('twitter.com' in href.lower() or 'x.com' in href.lower()):
+                            twitter_url = href
+
                 if role and any(kw in role.lower() for kw in excluded_keywords):
                     continue
-                
+
                 member_data = {
                     "name": name,
                     "role": role,
