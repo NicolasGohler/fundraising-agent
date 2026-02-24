@@ -233,7 +233,9 @@ def get_projects_from_rootdata():
         print("⏳ Waited 5 seconds for JavaScript to render")
         
         print("\n🔍 Searching for project links...")
-        project_links = page.locator("a[href*='/Projects/detail/']").all()
+        # Only select links in the sticky first column (Project column), not Investors column
+        # The Project column uses td.b-table-sticky-column, while Investors use td.align_left
+        project_links = page.locator("td.b-table-sticky-column a[href*='/Projects/detail/']").all()
         print(f"   Found {len(project_links)} potential project links")
         
         projects = []
@@ -254,9 +256,14 @@ def get_projects_from_rootdata():
                 
                 if not href.startswith("http"):
                     href = "https://www.rootdata.com" + href
-                
-                # Use name as key to avoid duplicates
-                clean_name = text.strip().split('\n')[0]
+
+                # Extract clean name from URL path (more reliable than inner_text which
+                # can include ticker badges like "MYX FinanceMYX" instead of "MYX Finance")
+                from urllib.parse import unquote
+                url_name = href.split('/Projects/detail/')[-1].split('?')[0]
+                url_name = unquote(url_name).strip()
+
+                clean_name = url_name if url_name else text.strip().split('\n')[0]
                 if clean_name in seen_names or len(clean_name) < 2:
                     continue
                 
