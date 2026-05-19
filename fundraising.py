@@ -3,6 +3,7 @@ from bs4 import BeautifulSoup
 from telethon.sync import TelegramClient
 from telethon.sessions import StringSession
 from telethon.tl.types import User
+from telethon.errors import FloodWaitError
 from dotenv import load_dotenv
 import time
 import requests
@@ -1138,11 +1139,103 @@ def extract_twitter_username(twitter_url):
         return username
     return None
 
-def generate_name_candidates(name):
-    """Generate common Telegram username candidates from a person's name.
+def get_company_shorthands(company_name):
+    """Derive shorthand tokens from a company name for username pattern generation.
 
-    Produces patterns like: FirstLast, firstlast, first_last, firstl, flast
-    Returns a list of candidates ordered by likelihood.
+    e.g. "Open Campus" → ["open", "campus", "opencampus", "oc"]
+         "LayerZero Labs" → ["layer", "zero", "layerzero", "lz"]
+         "DeFi Technologies" → ["defi"]
+    """
+    if not company_name or not company_name.isascii():
+        return []
+
+    SUFFIXES = {
+        'labs', 'protocol', 'protocols', 'network', 'networks', 'finance',
+        'technologies', 'technology', 'tech', 'dao', 'foundation', 'capital',
+        'ventures', 'venture', 'inc', 'ltd', 'llc', 'co', 'corp', 'group',
+        'platform', 'platforms', 'exchange', 'markets', 'market', 'ecosystem'
+    }
+
+    # Split camelCase boundaries first, then split on spaces/hyphens/underscores
+    name_spaced = re.sub(r'([a-z])([A-Z])', r'\1 \2', company_name.strip())
+    words = re.split(r'[\s\-_]+', name_spaced)
+    words = [w for w in words if w]
+
+    meaningful = [w for w in words if w.lower() not in SUFFIXES]
+    if not meaningful:
+        meaningful = words  # fallback: nothing was left after stripping suffixes
+
+    shorthands = set()
+
+    # Each meaningful word individually
+    for w in meaningful:
+        clean = re.sub(r'[^a-zA-Z0-9]', '', w)
+        if clean and len(clean) >= 2:
+            shorthands.add(clean.lower())
+
+    # Full joined form (for multi-word companies)
+    if len(meaningful) > 1:
+        full = re.sub(r'[^a-zA-Z0-9]', '', ''.join(meaningful))
+        if full:
+            shorthands.add(full.lower())
+        # Initials (e.g. "Open Campus" → "oc")
+        if 2 <= len(meaningful) <= 4:
+            initials = ''.join(w[0] for w in meaningful if w)
+            if len(initials) >= 2:
+                shorthands.add(initials.lower())
+
+    return list(shorthands)
+
+
+def score_entity_match(entity, person_name, candidate, candidate_idx, company_shorthands):
+    """Score how well a Telegram entity matches a person.
+
+    Returns a float score (higher = better match), or None if first name doesn't match
+    (used to reject obvious false positives).
+
+    Scoring:
+      +3  first name AND last name both match TG profile
+      +1  first name matches only (last name often missing on TG)
+      +1  candidate contains a company shorthand (more specific pattern)
+      +0–0.5  small positional bonus (earlier candidates are more likely)
+    None → first name doesn't match at all → reject
+    """
+    tg_first = (entity.first_name or '').lower().strip()
+    tg_last  = (entity.last_name  or '').lower().strip()
+    parts = person_name.lower().split()
+    person_first = parts[0] if parts else ''
+    person_last  = parts[-1] if len(parts) > 1 else ''
+
+    first_match = bool(person_first and (person_first in tg_first or tg_first in person_first))
+    last_match  = bool(person_last  and (person_last  in tg_last  or tg_last  in person_last))
+
+    if not first_match:
+        return None  # Reject — first name is the minimum bar
+
+    score = 3.0 if (first_match and last_match) else 1.0
+
+    # Company-pattern bonus: candidate contains a company shorthand
+    candidate_lower = candidate.lower()
+    if any(co in candidate_lower for co in company_shorthands):
+        score += 1.0
+
+    # Small positional bonus: earlier candidates are more likely patterns
+    score += max(0.0, 0.5 - candidate_idx * 0.02)
+
+    return score
+
+
+def generate_name_candidates(name, company_name=None):
+    """Generate Telegram username candidates from a person's name and company.
+
+    Candidate order (most → least likely):
+      1. first_co, firstCo, co_first, CoFirst  (first + company)
+      2. last_co,  lastCo,  co_last,  CoLast   (last  + company)
+      3. no-separator variants: firstco, cofirst, lastco, colast
+      4. JohnDoe, john_doe, johndoe             (name-only)
+      5. johnd, jdoe                            (abbreviated)
+
+    Returns deduplicated list of valid TG usernames (5–32 chars, [a-zA-Z0-9_]).
     """
     if not name:
         return []
@@ -1150,24 +1243,55 @@ def generate_name_candidates(name):
     if len(parts) < 2:
         return []
     first = parts[0]
-    last = parts[-1]
-    # Skip names with non-ASCII characters (unlikely to be TG usernames)
+    last  = parts[-1]
     if not first.isascii() or not last.isascii():
         return []
-    # Telegram usernames must be 5+ characters
+
+    seen = set()
     candidates = []
-    for c in [
-        f"{first}{last}", # JohnDoe
-        f"{first.lower()}{last.lower()}", # johndoe
-        f"{first.lower()}_{last.lower()}", # john_doe
-        f"{first.lower()}{last[0].lower()}", # johnd (if 5+ chars)
-        f"{first[0].lower()}{last.lower()}", # jdoe (if 5+ chars)
-        f"{first.lower()}.{last.lower()}", # john.doe — invalid on TG but some use underscores
-    ]:
-        # Telegram usernames: 5-32 chars, alphanumeric + underscores only
-        clean = re.sub(r'[^a-zA-Z0-9_]', '', c)
-        if len(clean) >= 5 and clean not in candidates:
-            candidates.append(clean)
+
+    def add(raw_list):
+        for c in raw_list:
+            clean = re.sub(r'[^a-zA-Z0-9_]', '', c)
+            if 5 <= len(clean) <= 32 and clean not in seen:
+                seen.add(clean)
+                candidates.append(clean)
+
+    f  = first.lower()
+    l  = last.lower()
+    Fc = first[0].upper() + first[1:].lower()  # Title-cased first
+    Lc = last[0].upper()  + last[1:].lower()   # Title-cased last
+
+    # --- Company-inclusive patterns (highest priority) ---
+    if company_name:
+        for co in get_company_shorthands(company_name):
+            Co = co[0].upper() + co[1:]  # Title-cased company shorthand
+            add([
+                # first + company
+                f"{f}_{co}",        # john_aethir
+                f"{f}{Co}",         # johnAethir
+                f"{Co}_{Fc}",       # Aethir_John
+                f"{co}_{f}",        # aethir_john
+                f"{f}{co}",         # johnaethir
+                f"{co}{f}",         # aethirjohn
+                # last + company
+                f"{l}_{co}",        # smith_aethir
+                f"{l}{Co}",         # smithAethir
+                f"{Co}_{Lc}",       # Aethir_Smith
+                f"{co}_{l}",        # aethir_smith
+                f"{l}{co}",         # smithaethir
+                f"{co}{l}",         # aethirsmith
+            ])
+
+    # --- Name-only patterns (lower priority) ---
+    add([
+        f"{first}{last}",   # JohnDoe
+        f"{f}{l}",          # johndoe
+        f"{f}_{l}",         # john_doe
+        f"{f}{l[0]}",       # johnd
+        f"{f[0]}{l}",       # jdoe
+    ])
+
     return candidates
 
 def resolve_telegram_usernames(people):
@@ -1215,55 +1339,96 @@ def resolve_telegram_usernames(people):
                 except Exception:
                     print(f" {username} not found on Telegram")
 
-                time.sleep(1)
+                time.sleep(1.5)
         else:
             print(" [Pass 1] No Twitter usernames to check")
 
-        # --- Pass 2: Name-based patterns for unresolved people ---
+        # --- Pass 2: Name + company pattern matching for unresolved people ---
         unresolved = [p for p in people if not p.get('telegram_username') and p.get('name')]
         if unresolved:
-            print(f"\n [Pass 2] Trying name-based patterns for {len(unresolved)} unresolved people...")
+            print(f"\n [Pass 2] Trying name/company patterns for {len(unresolved)} unresolved people...")
 
             name_resolved = 0
             for person in unresolved:
-                candidates = generate_name_candidates(person['name'])
+                person_name    = person['name']
+                company_name   = person.get('project')
+                co_shorthands  = get_company_shorthands(company_name) if company_name else []
+                candidates     = generate_name_candidates(person_name, company_name)
+
                 if not candidates:
                     continue
 
-                found = False
-                for candidate in candidates:
+                found_matches = []  # (score, candidate, entity, tg_username)
+
+                for idx, candidate in enumerate(candidates):
                     total_checked += 1
                     try:
                         entity = client.get_entity(candidate)
                         if isinstance(entity, User):
-                            # Verify the TG user's name roughly matches to avoid false positives
-                            tg_first = (entity.first_name or '').lower()
-                            tg_last = (entity.last_name or '').lower()
-                            person_parts = person['name'].lower().split()
-                            person_first = person_parts[0] if person_parts else ''
-                            person_last = person_parts[-1] if len(person_parts) > 1 else ''
-
-                            # Accept if first name matches (last name on TG is often missing)
-                            if person_first and (person_first in tg_first or tg_first in person_first):
+                            score = score_entity_match(
+                                entity, person_name, candidate, idx, co_shorthands
+                            )
+                            if score is not None:
                                 tg_username = f"@{entity.username}" if entity.username else f"@{candidate}"
-                                person['telegram_username'] = tg_username
-                                resolved_count += 1
-                                name_resolved += 1
-                                print(f" {person['name']} {candidate} {tg_username} (name match)")
-                                found = True
-                                break
+                                found_matches.append((score, candidate, entity, tg_username))
+                                # High-confidence hit (first+last match) — no need to keep looking
+                                if score >= 3.0:
+                                    break
                             else:
-                                print(f"  {person['name']} {candidate} exists but name mismatch "
+                                print(f"  {person_name}: {candidate} exists but name mismatch "
                                       f"(TG: {entity.first_name} {entity.last_name})")
+                    except FloodWaitError as e:
+                        print(f"  Rate limited — waiting {e.seconds}s before continuing...")
+                        time.sleep(e.seconds + 2)
+                        # Retry the same candidate once after the wait
+                        try:
+                            entity = client.get_entity(candidate)
+                            if isinstance(entity, User):
+                                score = score_entity_match(
+                                    entity, person_name, candidate, idx, co_shorthands
+                                )
+                                if score is not None:
+                                    tg_username = f"@{entity.username}" if entity.username else f"@{candidate}"
+                                    found_matches.append((score, candidate, entity, tg_username))
+                                    if score >= 3.0:
+                                        break
+                        except Exception:
+                            pass
                     except Exception:
-                        pass # Silently skip failed candidates to reduce noise
+                        pass  # Username not found — silently skip
 
-                    time.sleep(1)
+                    time.sleep(1.5)
 
-                if not found:
-                    print(f" {person['name']} no match from {len(candidates)} candidates")
+                if found_matches:
+                    # Rank by score descending; deduplicate by entity id
+                    seen_ids = set()
+                    unique_matches = []
+                    for match in sorted(found_matches, key=lambda x: x[0], reverse=True):
+                        eid = match[2].id
+                        if eid not in seen_ids:
+                            seen_ids.add(eid)
+                            unique_matches.append(match)
 
-            print(f"\n [Pass 2] Name-based resolution: {name_resolved}/{len(unresolved)} resolved")
+                    best_score, best_candidate, _, best_tg = unique_matches[0]
+                    person['telegram_username'] = best_tg
+                    resolved_count += 1
+                    name_resolved += 1
+
+                    if len(unique_matches) > 1:
+                        alts = ', '.join(
+                            f"{tg} via {c} (score={s:.1f})"
+                            for s, c, _, tg in unique_matches[1:]
+                        )
+                        person['telegram_alternatives'] = alts
+                        print(f"  {person_name}: {best_tg} (score={best_score:.1f}, "
+                              f"pattern={best_candidate}) | alternatives: {alts}")
+                    else:
+                        print(f"  {person_name}: {best_tg} "
+                              f"(score={best_score:.1f}, pattern={best_candidate})")
+                else:
+                    print(f"  {person_name}: no match from {len(candidates)} candidates")
+
+            print(f"\n [Pass 2] Name/company resolution: {name_resolved}/{len(unresolved)} resolved")
 
         client.disconnect()
     except Exception as e:
