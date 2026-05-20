@@ -983,24 +983,53 @@ def enrich_people_with_emails(people_with_linkedin):
     print(f"\n Bulk enrichment complete: {len(enrichment_results)} people enriched with emails")
     return enrichment_results
 
+def _load_cryptorank_cookies():
+    """Load CryptoRank storage state from the CRYPTORANK_COOKIES env var.
+
+    Returns a dict ready to pass to browser.new_context(storage_state=...)
+    or None if the env var is not set.
+    """
+    raw = os.getenv("CRYPTORANK_COOKIES")
+    if not raw:
+        return None
+    try:
+        import base64, json as _json
+        return _json.loads(base64.b64decode(raw).decode())
+    except Exception as e:
+        print(f" Could not decode CRYPTORANK_COOKIES: {e}")
+        return None
+
+# Tracks whether we've already sent the cookie-expiry Slack warning this run
+_cryptorank_cookie_warning_sent = False
+
 def fetch_team_members(project_url):
     print(f"\n{'='*60}")
     print(f" STEP 2: Fetching team members from {project_url}")
     print(f"{'='*60}")
-    
+
+    global _cryptorank_cookie_warning_sent
+    storage_state = _load_cryptorank_cookies()
+
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
-        page = browser.new_page()
-        
+
+        # Inject saved session cookies if available so social links are visible
+        context = (
+            browser.new_context(storage_state=storage_state)
+            if storage_state
+            else browser.new_context()
+        )
+        page = context.new_page()
+
         # Convert /ico/ URLs to /price/.../team format
-        team_url = project_url.replace('/ico/', '/price/') 
+        team_url = project_url.replace('/ico/', '/price/')
         if not team_url.endswith('/team'):
             team_url = team_url.split('#')[0]
             team_url = team_url.rstrip('/') + '/team'
-        
+
         # Set longer timeout for page navigation
         page.set_default_timeout(60000) # 60 seconds
-        
+
         print(f" Loading team page: {team_url}")
         max_retries = 2
         for attempt in range(max_retries):
@@ -1025,6 +1054,23 @@ def fetch_team_members(project_url):
                         print(f" Fallback also failed: {str(e2)}")
                         browser.close()
                         return []
+
+        # Detect if CryptoRank redirected us to the login page (expired/missing cookies)
+        current_url = page.url
+        if "login" in current_url or "signin" in current_url or "sign-in" in current_url:
+            print(" CryptoRank session expired or not set — team social links will be missing")
+            print(" To fix: run save_cookies.py locally and update the CRYPTORANK_COOKIES secret")
+            if not _cryptorank_cookie_warning_sent:
+                _cryptorank_cookie_warning_sent = True
+                try:
+                    send_error_to_slack(
+                        "⚠️ CryptoRank session expired — team LinkedIn/Twitter links are missing this week.\n"
+                        "Run `python save_cookies.py` locally and update the `CRYPTORANK_COOKIES` GitHub Secret."
+                    )
+                except Exception:
+                    pass
+            browser.close()
+            return []
         
         time.sleep(3)
         print(" Waited 3 seconds for JavaScript to render")
