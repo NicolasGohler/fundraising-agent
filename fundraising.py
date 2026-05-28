@@ -1,11 +1,9 @@
 from playwright.sync_api import sync_playwright
 from bs4 import BeautifulSoup
-from telethon.sync import TelegramClient
-from telethon.sessions import StringSession
-from telethon.tl.types import User
-from telethon.errors import FloodWaitError
 from dotenv import load_dotenv
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
+import random
 import requests
 import re
 from urllib.parse import urlparse
@@ -15,287 +13,316 @@ import os
 load_dotenv()
 
 # Configuration
-MAX_PROJECTS = 15 # Maximum projects to collect from each source (reduced by 10%)
+MAX_PROJECTS = 30 # Maximum projects to collect from each source
 
 # Apollo.io API Configuration
 APOLLO_API_KEY = os.getenv("APOLLO_API_KEY")
 APOLLO_API_URL = "https://api.apollo.io/api/v1/mixed_people/api_search"
 APOLLO_BULK_ENRICHMENT_URL = "https://api.apollo.io/api/v1/people/bulk_match"
 
-# Telegram API Configuration
-TELEGRAM_API_ID = int(os.getenv("TELEGRAM_API_ID"))
-TELEGRAM_API_HASH = os.getenv("TELEGRAM_API_HASH")
-TELEGRAM_SESSION = os.getenv("TELEGRAM_SESSION")
+# Checkpoint — survives mid-run crashes so scraping doesn't repeat on retry
+CHECKPOINT_FILE = "fundraising_checkpoint.json"
 
-def get_projects_from_cryptorank():
-    """Fetch projects from CryptoRank funding rounds
+def _load_checkpoint():
+    """Return the checkpoint dict, or {} if none exists."""
+    try:
+        with open(CHECKPOINT_FILE) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
 
-    Note: CryptoRank uses Cloudflare bot protection which may block automated access.
-    This function implements graceful degradation - if blocked, it returns an empty list
-    and the script continues with other data sources.
+def _save_checkpoint(data: dict):
+    """Atomically write *data* to the checkpoint file."""
+    tmp = CHECKPOINT_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f)
+    os.replace(tmp, CHECKPOINT_FILE)   # atomic on POSIX + Windows
+
+def _clear_checkpoint():
+    try:
+        os.remove(CHECKPOINT_FILE)
+    except FileNotFoundError:
+        pass
+
+# ── Browser helpers ──────────────────────────────────────────────────────────
+
+def _sleep(base, lo=0.7, hi=1.4):
+    """Sleep for base * uniform(lo, hi) seconds to avoid mechanical timing."""
+    time.sleep(max(0.3, base * random.uniform(lo, hi)))
+
+
+def _is_cloudflare_blocked(page):
+    """Return True if the current page looks like a Cloudflare challenge."""
+    try:
+        c = page.content()
+        return (
+            "Verify you are human" in c
+            or "Just a moment" in c
+            or "challenge" in c[:2000].lower()
+        )
+    except Exception:
+        return False
+
+
+def _new_stealth_page(context):
+    """Create a new page from *context* with stealth patches applied."""
+    page = context.new_page()
+    page.set_default_timeout(30000)
+    try:
+        from playwright_stealth import Stealth
+        Stealth().apply_stealth_sync(page)
+    except ImportError:
+        pass
+    return page
+
+
+def _create_browser_context(playwright_instance):
+    """Launch one anti-detection Chromium browser and return (browser, context).
+
+    The context is pre-loaded with CryptoRank session cookies (if available)
+    and a human-like viewport/UA so the same session is reused for every
+    navigation in the run.
+    """
+    browser = playwright_instance.chromium.launch(
+        headless=True,
+        args=[
+            '--disable-blink-features=AutomationControlled',
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--disable-dev-shm-usage',
+        ],
+    )
+    storage_state = _load_cryptorank_cookies()  # resolved at call time — fine
+    context = browser.new_context(
+        storage_state=storage_state,
+        viewport={'width': 1920, 'height': 1080},
+        user_agent=(
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
+            'AppleWebKit/537.36 (KHTML, like Gecko) '
+            'Chrome/121.0.0.0 Safari/537.36'
+        ),
+        locale='en-US',
+        timezone_id='America/New_York',
+    )
+    return browser, context
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def get_projects_from_cryptorank(context):
+    """Fetch projects from CryptoRank funding rounds.
+
+    Uses the shared browser *context* — no new browser launch needed.
+    Gracefully returns [] if Cloudflare blocks the request.
     """
     url = "https://cryptorank.io/funding-rounds"
     print(f"\n{'='*60}")
     print(f" SOURCE 1: Fetching projects from CryptoRank")
     print(f"{'='*60}")
 
+    page = _new_stealth_page(context)
+    print(" ℹ Using stealth mode")
+
     try:
-        # Try to import playwright-stealth for better detection evasion
-        try:
-            from playwright_stealth import Stealth
-            use_stealth = True
-        except ImportError:
-            use_stealth = False
-
-        with sync_playwright() as p:
-            # Launch browser with anti-detection settings
-            browser = p.chromium.launch(
-                headless=True,
-                args=[
-                    '--disable-blink-features=AutomationControlled',
-                    '--no-sandbox',
-                    '--disable-setuid-sandbox',
-                    '--disable-dev-shm-usage',
-                ]
-            )
-
-            context = browser.new_context(
-                viewport={'width': 1920, 'height': 1080},
-                user_agent='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
-                locale='en-US',
-                timezone_id='America/New_York',
-            )
-
-            page = context.new_page()
-
-            # Apply stealth if available
-            if use_stealth:
-                stealth = Stealth()
-                stealth.apply_stealth_sync(page)
-                print(" ℹ Using stealth mode")
-
-            # Set longer timeout for page navigation
-            page.set_default_timeout(60000) # 60 seconds
-
-            print(" Loading page...")
-            max_retries = 3
-            for attempt in range(max_retries):
-                try:
-                    page.goto(url, wait_until="domcontentloaded", timeout=60000)
-                    print(" Page loaded successfully")
-                    break
-                except Exception as e:
-                    if attempt < max_retries - 1:
-                        wait_time = (attempt + 1) * 5
-                        print(f" Attempt {attempt + 1} failed: {str(e)}")
-                        print(f" Retrying in {wait_time} seconds...")
-                        time.sleep(wait_time)
-                    else:
-                        print(f" All {max_retries} attempts failed: {str(e)}")
-                        browser.close()
-                        return [] # Graceful degradation
-
-            # Wait for potential Cloudflare challenge to resolve
-            print(" Waiting for page to fully render...")
-            time.sleep(10)
-
-            # Check for Cloudflare challenge
-            content = page.content()
-            if "Verify you are human" in content or "Just a moment" in content or "challenge" in content[:2000].lower():
-                print(" CryptoRank is protected by Cloudflare bot detection")
-                print(" ℹ Skipping CryptoRank - will continue with other data sources")
-                browser.close()
-                return [] # Graceful degradation
-
-            print(" Waiting for table rows to load...")
+        print(" Loading page...")
+        for attempt in range(3):
             try:
-                page.wait_for_selector("a[href*='/ico/']", timeout=15000)
-                print(" Found project links!")
+                page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                print(" Page loaded successfully")
+                break
             except Exception as e:
-                # Try alternative selectors
-                try:
-                    page.wait_for_selector("a[href*='/price/']", timeout=10000)
-                    print(" Found project links (via price URLs)!")
-                except:
-                    print(f" Timeout waiting for project links")
-                    print(" The page structure may have changed or content is blocked")
+                if attempt < 2:
+                    wait_time = (attempt + 1) * 5
+                    print(f" Attempt {attempt + 1} failed: {e}")
+                    print(f" Retrying in {wait_time} seconds...")
+                    time.sleep(wait_time)
+                else:
+                    print(f" All 3 attempts failed: {e}")
+                    page.close()
+                    return []
 
-            time.sleep(5)
-            print(" Waited additional 5 seconds for complete rendering")
+        print(" Waiting for page to fully render...")
+        _sleep(3)
 
-            print("\n Searching for project links using Playwright...")
+        if _is_cloudflare_blocked(page):
+            print(" CryptoRank is protected by Cloudflare bot detection")
+            print(" ℹ Skipping CryptoRank - will continue with other data sources")
+            page.close()
+            return []
 
-            # Try multiple selectors to find project links
-            project_links = page.locator("a[href*='/ico/']").all()
-            if not project_links:
-                project_links = page.locator("a[href*='/price/']").all()
+        print(" Waiting for table rows to load...")
+        try:
+            page.wait_for_selector("a[href*='/ico/']", timeout=15000)
+            print(" Found project links!")
+        except Exception:
+            try:
+                page.wait_for_selector("a[href*='/price/']", timeout=10000)
+                print(" Found project links (via price URLs)!")
+            except Exception:
+                print(" Timeout waiting for project links — structure may have changed")
 
-            print(f" Found {len(project_links)} potential project links")
+        _sleep(5)
+        print(" Waited for complete rendering")
 
-            # If no links found, check if we're still being blocked
-            if len(project_links) == 0:
-                total_links = len(page.locator("a").all())
-                if total_links < 10:
-                    print(" Very few links on page - likely still blocked by Cloudflare")
-                    print(" ℹ Skipping CryptoRank - will continue with other data sources")
-                    browser.close()
-                    return [] # Graceful degradation
+        print("\n Searching for project links using Playwright...")
+        project_links = page.locator("a[href*='/ico/']").all()
+        if not project_links:
+            project_links = page.locator("a[href*='/price/']").all()
 
-            projects = []
-            seen_urls = set()
-            max_projects = MAX_PROJECTS
+        print(f" Found {len(project_links)} potential project links")
 
-            for idx, link in enumerate(project_links):
-                if len(projects) >= max_projects:
-                    print(f"  Collected {max_projects} projects, stopping collection")
-                    break
+        if len(project_links) == 0 and len(page.locator("a").all()) < 10:
+            print(" Very few links on page - likely still blocked by Cloudflare")
+            print(" ℹ Skipping CryptoRank - will continue with other data sources")
+            page.close()
+            return []
 
-                try:
-                    href = link.get_attribute("href")
-                    text = link.inner_text()
+        projects = []
+        seen_urls = set()
 
-                    if not href or not text.strip():
-                        continue
-
-                    if not href.startswith("http"):
-                        href = "https://cryptorank.io" + href
-
-                    # Fix: Convert /ico/ URLs to /price/ URLs for proper project page access
-                    if '/ico/' in href:
-                        href = href.replace('/ico/', '/price/')
-                        print(f" Converted ICO URL to price URL: {href}")
-
-                    if href in seen_urls:
-                        continue
-
-                    seen_urls.add(href)
-                    projects.append({
-                        "name": text.strip(),
-                        "url": href,
-                        "source": "cryptorank_funding_rounds",
-                        "source_url": "https://cryptorank.io/funding-rounds",
-                        "source_type": "funding_platform"
-                    })
-
-                except Exception as e:
-                    print(f"  Error processing link {idx}: {str(e)}")
+        for idx, link in enumerate(project_links):
+            if len(projects) >= MAX_PROJECTS:
+                print(f"  Collected {MAX_PROJECTS} projects, stopping")
+                break
+            try:
+                href = link.get_attribute("href")
+                text = link.inner_text()
+                if not href or not text.strip():
                     continue
+                if not href.startswith("http"):
+                    href = "https://cryptorank.io" + href
+                if '/ico/' in href:
+                    href = href.replace('/ico/', '/price/')
+                    print(f" Converted ICO URL to price URL: {href}")
+                if href in seen_urls:
+                    continue
+                seen_urls.add(href)
+                projects.append({
+                    "name": text.strip(),
+                    "url": href,
+                    "source": "cryptorank_funding_rounds",
+                    "source_url": "https://cryptorank.io/funding-rounds",
+                    "source_type": "funding_platform",
+                })
+            except Exception as e:
+                print(f"  Error processing link {idx}: {e}")
 
-            browser.close()
-
-            print(f"\n{'='*60}")
-            print(f" Total unique projects found: {len(projects)}")
-            print(f"{'='*60}\n")
-
-            return projects
+        print(f"\n{'='*60}")
+        print(f" Total unique projects found: {len(projects)}")
+        print(f"{'='*60}\n")
 
     except Exception as e:
-        print(f" CryptoRank scraping failed: {str(e)}")
+        print(f" CryptoRank scraping failed: {e}")
         print(" ℹ Continuing with other data sources...")
-        return [] # Graceful degradation - return empty list instead of crashing
+        projects = []
 
-def get_projects_from_rootdata():
-    """Fetch projects from RootData fundraising page"""
+    page.close()
+    return projects
+
+def get_projects_from_rootdata(context):
+    """Fetch projects from RootData fundraising page.
+
+    Uses the shared browser *context* — no new browser launch needed.
+    """
     url = "https://www.rootdata.com/Fundraising"
     print(f"\n{'='*60}")
     print(f" SOURCE 2: Fetching projects from RootData")
     print(f"{'='*60}")
-    
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_page()
-        
-        # Set longer timeout for page navigation
-        page.set_default_timeout(60000) # 60 seconds
-        
+
+    page = _new_stealth_page(context)
+
+    # Inject RootData cookies before the first navigation so the WAF CAPTCHA is bypassed
+    rootdata_cookies = _load_rootdata_cookies()
+    if rootdata_cookies:
+        try:
+            context.add_cookies(rootdata_cookies)
+            print(" ℹ RootData cookies loaded")
+        except Exception as e:
+            print(f" Could not inject RootData cookies: {e}")
+    else:
+        print(" ⚠ ROOTDATA_COOKIES not set — page may be blocked by CAPTCHA")
+
+    try:
         print(" Loading page...")
-        max_retries = 3
-        for attempt in range(max_retries):
+        for attempt in range(3):
             try:
-                # Use 'load' instead of 'networkidle' for more reliable loading
-                page.goto(url, wait_until="load", timeout=60000)
+                page.goto(url, wait_until="domcontentloaded", timeout=30000)
                 print(" Page loaded successfully")
                 break
             except Exception as e:
-                if attempt < max_retries - 1:
+                if attempt < 2:
                     wait_time = (attempt + 1) * 5
-                    print(f" Attempt {attempt + 1} failed: {str(e)}")
+                    print(f" Attempt {attempt + 1} failed: {e}")
                     print(f" Retrying in {wait_time} seconds...")
                     time.sleep(wait_time)
                 else:
-                    print(f" All {max_retries} attempts failed. Trying with 'domcontentloaded' as fallback...")
-                    try:
-                        page.goto(url, wait_until="domcontentloaded", timeout=60000)
-                        print(" Page loaded with fallback method")
-                        break
-                    except Exception as e2:
-                        print(f" Fallback also failed: {str(e2)}")
-                        browser.close()
-                        raise Exception(f"Failed to load RootData page after {max_retries} attempts: {str(e2)}")
-        
-        time.sleep(5)
-        print(" Waited 5 seconds for JavaScript to render")
-        
+                    print(f" All 3 attempts failed: {e}")
+                    page.close()
+                    return []
+
+        _sleep(5)
+        print(" Waited for JavaScript to render")
+
+        # Check if we're still on a CAPTCHA page
+        page_content = page.content()
+        if "captcha" in page_content[:3000].lower() or "WafCaptcha" in page_content:
+            print(" ⚠ RootData CAPTCHA detected — cookies missing or expired")
+            print(" To fix: run save_cookies.py and update ROOTDATA_COOKIES in .env / GitHub Secrets")
+            page.close()
+            return []
+
         print("\n Searching for project links...")
-        # Only select links in the sticky first column (Project column), not Investors column
-        # The Project column uses td.b-table-sticky-column, while Investors use td.align_left
-        project_links = page.locator("td.b-table-sticky-column a[href*='/Projects/detail/']").all()
+        project_links = page.locator(
+            "table a[href*='/projects/detail/']"
+        ).all()
         print(f" Found {len(project_links)} potential project links")
-        
+
         projects = []
         seen_names = set()
-        max_projects = MAX_PROJECTS
-        
+        from urllib.parse import unquote
+
         for idx, link in enumerate(project_links):
-            if len(projects) >= max_projects:
-                print(f"  Collected {max_projects} projects, stopping collection")
+            if len(projects) >= MAX_PROJECTS:
+                print(f"  Collected {MAX_PROJECTS} projects, stopping")
                 break
-            
             try:
                 href = link.get_attribute("href")
                 text = link.inner_text()
-                
                 if not href or not text.strip():
                     continue
-                
                 if not href.startswith("http"):
                     href = "https://www.rootdata.com" + href
-
-                # Extract clean name from URL path (more reliable than inner_text which
-                # can include ticker badges like "MYX FinanceMYX" instead of "MYX Finance")
-                from urllib.parse import unquote
-                url_name = href.split('/Projects/detail/')[-1].split('?')[0]
+                url_name = href.split('/projects/detail/')[-1].split('?')[0]
                 url_name = unquote(url_name).strip()
-
                 clean_name = url_name if url_name else text.strip().split('\n')[0]
                 if clean_name in seen_names or len(clean_name) < 2:
                     continue
-                
                 seen_names.add(clean_name)
                 projects.append({
                     "name": clean_name,
                     "url": href,
                     "source": "rootdata_fundraising",
                     "source_url": "https://www.rootdata.com/Fundraising",
-                    "source_type": "funding_platform"
+                    "source_type": "funding_platform",
                 })
-                
             except Exception as e:
-                print(f"  Error processing link {idx}: {str(e)}")
-                continue
-        
-        browser.close()
-        
+                print(f"  Error processing link {idx}: {e}")
+
         print(f"\n{'='*60}")
         print(f" Total RootData projects found: {len(projects)}")
         print(f"{'='*60}\n")
-        
-        return projects
 
-def get_all_projects():
-    """Fetch and merge projects from all sources"""
-    cryptorank_projects = get_projects_from_cryptorank()
-    rootdata_projects = get_projects_from_rootdata()
+    except Exception as e:
+        print(f" RootData scraping failed: {e}")
+        projects = []
+
+    page.close()
+    return projects
+
+def get_all_projects(context):
+    """Fetch and merge projects from all sources using the shared browser context."""
+    cryptorank_projects = get_projects_from_cryptorank(context)
+    rootdata_projects = get_projects_from_rootdata(context)
     
     # Merge projects, avoiding duplicates by name (case-insensitive)
     all_projects = []
@@ -335,231 +362,404 @@ def get_all_projects():
     
     return all_projects
 
-def extract_company_website(project_url):
-    """Extract company website from main project page (not ICO/team pages)"""
-    print(f"\n Extracting company website from main project page: {project_url}")
-    
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_page()
-        
-        # Set longer timeout for page navigation
-        page.set_default_timeout(60000) # 60 seconds
-        
-        try:
-            # Use 'load' instead of 'networkidle' for more reliable loading
-            page.goto(project_url, wait_until="load", timeout=60000)
-            print(" Main project page loaded")
-            
-            time.sleep(3) # Give more time for dynamic content
-            html = page.content()
-            soup = BeautifulSoup(html, "html.parser")
-            
-            website = None
-            
-            # For CryptoRank: Look for website link in the Links section
-            if 'cryptorank.io' in project_url:
-                print(" Looking for website in CryptoRank Links section...")
-                
-                # Look for the "Links" section with multiple approaches
-                links_section = None
-                
-                # First, try to find the exact "Links" text (not containing "Links")
-                links_text = soup.find(text=lambda text: text and text.strip() == 'Links')
-                if links_text:
-                    links_section = links_text.parent
-                    print(f" Found exact 'Links' text in {links_section.name}")
-                else:
-                    # Fallback to other methods
-                    links_section = soup.find('div', string=re.compile(r'Links', re.I))
-                    if not links_section:
-                        links_section = soup.find('h3', string=re.compile(r'Links', re.I))
-                    if not links_section:
-                        links_section = soup.find('span', string=re.compile(r'Links', re.I))
-                    if not links_section:
-                        # Look for any element containing "Links"
-                        links_section = soup.find(text=re.compile(r'Links', re.I))
-                        if links_section:
-                            links_section = links_section.parent
-                
-                if links_section:
-                    print(" Found 'Links' section")
-                    # Find the parent container of the Links section
-                    links_container = links_section.find_parent()
-                    if links_container:
-                        # Look for the "Website" button specifically with more comprehensive search
-                        website_buttons = links_container.find_all('a', href=True)
-                        print(f" Found {len(website_buttons)} links in Links section")
-                        
-                        for link in website_buttons:
-                            href = link.get('href', '')
-                            text = link.get_text(strip=True).lower()
-                            
-                            print(f" Checking link: '{text}' -> {href}")
-                            
-                            # Look specifically for the "Website" button - improved matching
-                            if ('website' in text or 'site' in text) and href.startswith('http'):
-                                # Additional validation to ensure it's not a social media link
-                                if not any(social in href.lower() for social in ['twitter', 'telegram', 'discord', 'medium', 'github', 'youtube', 'linkedin', 'facebook', 'instagram', 'x.com', 'breakingthenews.net']):
-                                    website = href
-                                    print(f" Found Website button: {href}")
-                                    break
-                
-                # If no website found in Links section, look for sibling elements
-                if not website and links_section:
-                    print(" No website in Links section, checking sibling elements...")
-                    links_parent = links_section.find_parent()
-                    if links_parent:
-                        # Look for sibling divs that might contain the links
-                        siblings = links_parent.find_next_siblings()
-                        for sibling in siblings:
-                            if sibling.name == 'div':
-                                sibling_links = sibling.find_all('a', href=True)
-                                print(f" Found {len(sibling_links)} links in sibling div")
-                                
-                                for link in sibling_links:
-                                    href = link.get('href', '')
-                                    text = link.get_text(strip=True).lower()
-                                    
-                                    print(f" Checking sibling link: '{text}' -> {href}")
-                                    
-                                    # Look for website links
-                                    if ('website' in text or 'site' in text) and href.startswith('http'):
-                                        if not any(social in href.lower() for social in ['twitter', 'telegram', 'discord', 'medium', 'github', 'youtube', 'linkedin', 'facebook', 'instagram', 'x.com', 'breakingthenews.net']):
-                                            website = href
-                                            print(f" Found Website in sibling: {href}")
-                                            break
-                                if website:
-                                    break
-                
-                # If still no website found, try looking for the Links section more broadly
-                if not website:
-                    print(" Trying broader search for Links section...")
-                    # Look for any section that might contain links
-                    potential_sections = soup.find_all(['div', 'section'], class_=lambda x: x and any(keyword in x.lower() for keyword in ['link', 'social', 'connect']))
-                    
-                    for section in potential_sections:
-                        links_in_section = section.find_all('a', href=True)
-                        for link in links_in_section:
-                            href = link.get('href', '')
-                            text = link.get_text(strip=True).lower()
-                            
-                            # Look for website indicators
-                            if ('website' in text or 'site' in text) and href.startswith('http'):
-                                if not any(social in href.lower() for social in ['twitter', 'telegram', 'discord', 'medium', 'github', 'youtube', 'linkedin', 'facebook', 'instagram', 'x.com', 'breakingthenews.net']):
-                                    website = href
-                                    print(f" Found Website in broader search: {href}")
-                                    break
-                        if website:
-                            break
-                
-                # If no Website button found in Links section, try broader search
-                if not website:
-                    print(" No Website button found, trying broader search...")
-                    all_links = soup.find_all('a', href=True)
-                    print(f" Found {len(all_links)} total links on page")
-                    
-                    # First, try to find links that look like company websites
-                    potential_websites = []
-                    for link in all_links:
+def _parse_cryptorank_website_from_soup(soup):
+    """Pure helper: extract the company website URL from an already-parsed
+    CryptoRank project page.  Returns a URL string or None."""
+    website = None
+
+    print(" Looking for website in CryptoRank Links section...")
+
+    links_section = None
+
+    # First try exact 'Links' text (not just containing 'Links')
+    links_text = soup.find(string=lambda text: text and text.strip() == 'Links')
+    if links_text:
+        links_section = links_text.parent
+        print(f" Found exact 'Links' text in {links_section.name}")
+    else:
+        links_section = soup.find('div', string=re.compile(r'Links', re.I))
+        if not links_section:
+            links_section = soup.find('h3', string=re.compile(r'Links', re.I))
+        if not links_section:
+            links_section = soup.find('span', string=re.compile(r'Links', re.I))
+        if not links_section:
+            links_section = soup.find(string=re.compile(r'Links', re.I))
+            if links_section:
+                links_section = links_section.parent
+
+    if links_section:
+        print(" Found 'Links' section")
+        links_container = links_section.find_parent()
+        if links_container:
+            website_buttons = links_container.find_all('a', href=True)
+            print(f" Found {len(website_buttons)} links in Links section")
+
+            for link in website_buttons:
+                href = link.get('href', '')
+                text = link.get_text(strip=True).lower()
+                print(f" Checking link: '{text}' -> {href}")
+                if ('website' in text or 'site' in text) and href.startswith('http'):
+                    if not any(social in href.lower() for social in [
+                        'twitter', 'telegram', 'discord', 'medium', 'github',
+                        'youtube', 'linkedin', 'facebook', 'instagram', 'x.com',
+                        'breakingthenews.net'
+                    ]):
+                        website = href
+                        print(f" Found Website button: {href}")
+                        break
+
+    # Sibling fallback
+    if not website and links_section:
+        print(" No website in Links section, checking sibling elements...")
+        links_parent = links_section.find_parent()
+        if links_parent:
+            for sibling in links_parent.find_next_siblings():
+                if sibling.name == 'div':
+                    sibling_links = sibling.find_all('a', href=True)
+                    print(f" Found {len(sibling_links)} links in sibling div")
+                    for link in sibling_links:
                         href = link.get('href', '')
-                        text = link.get_text(strip=True)
-                        
-                        # Skip social media and internal links
-                        if any(skip in href.lower() for skip in ['twitter', 'telegram', 'discord', 'medium', 'github', 'youtube', 'linkedin', 'facebook', 'instagram', 'x.com', 'cryptorank.io', 'bcgame.bet', 'breakingthenews.net']):
-                            continue
-                        
-                        # Look for main website indicators
-                        if href.startswith('http'):
-                            domain = urlparse(href).netloc.lower()
-                            # Check if it looks like a company website (simple domain names)
-                            if '.' in domain and not any(skip in domain for skip in ['twitter', 'telegram', 'discord', 'medium', 'github', 'youtube', 'linkedin', 'facebook', 'instagram', 'x.com', 'notion.so', 'calendly.com', 'drive.google.com', 'apps.apple.com']):
-                                potential_websites.append((href, text, domain))
-                    
-                    # Sort by domain length (shorter domains are more likely to be company websites)
-                    potential_websites.sort(key=lambda x: len(x[2]))
-                    
-                    if potential_websites:
-                        website = potential_websites[0][0]
-                        print(f" Found potential website: {website}")
-                    else:
-                        print("  No suitable website found")
-            
-            # For RootData: Look for website link in project details
-            elif 'rootdata.com' in project_url:
-                print(" Looking for website in RootData project details...")
-                
-                # Use longer timeout for RootData pages
-                try:
-                    page.goto(project_url, wait_until="load", timeout=60000)
-                    time.sleep(3)
-                    html = page.content()
-                    soup = BeautifulSoup(html, "html.parser")
-                    print(" RootData page loaded successfully")
-                except:
-                    print("  RootData page load failed, using existing content")
-                
-                # Look for website links in the main content area
-                website_links = soup.find_all('a', href=True)
-                print(f" Found {len(website_links)} links on RootData page")
-                
-                # Look for the specific website link pattern (like tempo.xyz)
-                # This should be in the main content area below the project description
-                for link in website_links:
-                    href = link.get('href', '')
-                    text = link.get_text(strip=True)
-                    
-                    # Skip social media and internal links
-                    if any(skip in href.lower() for skip in ['twitter', 'telegram', 'discord', 'medium', 'github', 'youtube', 'linkedin', 'facebook', 'instagram', 'x.com', 'rootdata.com']):
-                        continue
-                    
-                    # Look for main website indicators
-                    if href.startswith('http'):
-                        # Check if this looks like a company website (not social media or services)
-                        domain = urlparse(href).netloc.lower()
-                        if not any(skip in domain for skip in ['twitter', 'telegram', 'discord', 'medium', 'github', 'youtube', 'linkedin', 'facebook', 'instagram', 'x.com', 'notion.so', 'calendly.com', 'drive.google.com', 'apps.apple.com']):
-                            website = href
-                            print(f" Found company website link: {href}")
-                            break
-            
-            browser.close()
-            
+                        text = link.get_text(strip=True).lower()
+                        print(f" Checking sibling link: '{text}' -> {href}")
+                        if ('website' in text or 'site' in text) and href.startswith('http'):
+                            if not any(social in href.lower() for social in [
+                                'twitter', 'telegram', 'discord', 'medium', 'github',
+                                'youtube', 'linkedin', 'facebook', 'instagram', 'x.com',
+                                'breakingthenews.net'
+                            ]):
+                                website = href
+                                print(f" Found Website in sibling: {href}")
+                                break
+                    if website:
+                        break
+
+    # Broader CSS-class search
+    if not website:
+        print(" Trying broader search for Links section...")
+        potential_sections = soup.find_all(
+            ['div', 'section'],
+            class_=lambda x: x and any(kw in x.lower() for kw in ['link', 'social', 'connect'])
+        )
+        for section in potential_sections:
+            for link in section.find_all('a', href=True):
+                href = link.get('href', '')
+                text = link.get_text(strip=True).lower()
+                if ('website' in text or 'site' in text) and href.startswith('http'):
+                    if not any(social in href.lower() for social in [
+                        'twitter', 'telegram', 'discord', 'medium', 'github',
+                        'youtube', 'linkedin', 'facebook', 'instagram', 'x.com',
+                        'breakingthenews.net'
+                    ]):
+                        website = href
+                        print(f" Found Website in broader search: {href}")
+                        break
             if website:
-                # Filter out telegram URLs - they're not valid company websites
-                if 't.me' in website.lower() or 'telegram' in website.lower():
-                    print(f" Found telegram URL instead of website: {website}")
-                    print(" Skipping - telegram URLs are not valid for Apollo enrichment")
-                    return None
-                
-                # Clean up the website URL
-                if not website.startswith('http'):
-                    website = 'https://' + website
-                
-                # Extract domain for Apollo search
-                try:
-                    domain = urlparse(website).netloc
-                    if domain.startswith('www.'):
-                        domain = domain[4:]
-                    
-                    # Double-check domain is not telegram
-                    if 't.me' in domain.lower() or 'telegram' in domain.lower():
-                        print(f" Domain appears to be telegram: {domain}")
-                        print(" Skipping - telegram domains are not valid for Apollo enrichment")
-                        return None
-                    
-                    print(f" Successfully found website: {website} (domain: {domain})")
-                    return {"website": website, "domain": domain}
-                except:
-                    print(f" Could not parse website URL: {website}")
-                    return None
+                break
+
+    # Last-resort: shortest external domain on the page
+    if not website:
+        print(" No Website button found, trying broader search...")
+        all_links = soup.find_all('a', href=True)
+        print(f" Found {len(all_links)} total links on page")
+        potential_websites = []
+        skip = [
+            'twitter', 'telegram', 'discord', 'medium', 'github', 'youtube',
+            'linkedin', 'facebook', 'instagram', 'x.com', 'cryptorank.io',
+            'bcgame.bet', 'breakingthenews.net'
+        ]
+        for link in all_links:
+            href = link.get('href', '')
+            if any(s in href.lower() for s in skip):
+                continue
+            if href.startswith('http'):
+                domain = urlparse(href).netloc.lower()
+                if '.' in domain and not any(s in domain for s in [
+                    'twitter', 'telegram', 'discord', 'medium', 'github', 'youtube',
+                    'linkedin', 'facebook', 'instagram', 'x.com', 'notion.so',
+                    'calendly.com', 'drive.google.com', 'apps.apple.com'
+                ]):
+                    potential_websites.append((href, domain))
+        potential_websites.sort(key=lambda x: len(x[1]))
+        if potential_websites:
+            website = potential_websites[0][0]
+            print(f" Found potential website: {website}")
+        else:
+            print("  No suitable website found")
+
+    return website
+
+
+def _parse_team_from_cryptorank_soup(soup, team_url):
+    """Pure helper: extract team members from an already-parsed CryptoRank /team page.
+    Returns a list of member dicts."""
+    members = []
+
+    excluded_keywords = [
+        'cto', 'chief technology', 'tech lead', 'engineer', 'engineering',
+        'developer', 'software', 'backend', 'frontend', 'full stack', 'fullstack',
+        'devops', 'sre', 'infrastructure', 'architect', 'technical',
+        'hr', 'human resource', 'people operations', 'people ops', 'talent',
+        'recruiting', 'recruiter', 'recruitment', 'hiring',
+        'trader', 'trading', 'quant', 'quantitative', 'portfolio manager',
+        'market maker', 'market making', 'derivatives', 'prop trading',
+        'sales', 'account executive', 'account manager', 'business development',
+        'bdr', 'sdr', 'revenue', 'partnerships', 'partner manager',
+        'product', 'product manager', 'product owner', 'product lead', 'cpo',
+        'chief product', 'product director', 'product head'
+    ]
+    name_pattern = re.compile(r'^[A-Z][a-z]+(\s+[A-Z][a-z]+){1,3}$')
+
+    name_tags = soup.find_all(
+        'p',
+        class_=lambda x: x and any(
+            'styles_name__' in c
+            for c in (x if isinstance(x, list) else [x])
+        )
+    )
+    print(f" Found {len(name_tags)} team member elements")
+
+    for name_tag in name_tags:
+        name = name_tag.get_text(strip=True)
+        if not name_pattern.match(name):
+            continue
+
+        role = None
+        linkedin_url = None
+        twitter_url = None
+
+        card = name_tag.find_parent(
+            'div',
+            class_=lambda x: x and any(
+                'styles_container__' in c
+                for c in (x if isinstance(x, list) else [x])
+            )
+        )
+        if not card:
+            card = name_tag.find_parent()
+            if card:
+                card = card.find_parent()
+            if card:
+                card = card.find_parent()
+
+        if card:
+            badge = card.find(
+                'button',
+                class_=lambda x: x and any(
+                    'styles_badge_root__' in c
+                    for c in (x if isinstance(x, list) else [x])
+                )
+            )
+            if badge:
+                role = badge.get_text(strip=True)
             else:
-                print(" No company website found on main project page")
-                return None
-                
-        except Exception as e:
-            print(f" Error extracting website: {str(e)}")
-            browser.close()
+                next_p = name_tag.find_next_sibling('p')
+                if next_p:
+                    potential_role = next_p.get_text(strip=True)
+                    if potential_role and len(potential_role) < 50 and not name_pattern.match(potential_role):
+                        role = potential_role
+
+            for a in card.find_all('a', href=True):
+                href = a['href']
+                if not linkedin_url and 'linkedin.com' in href.lower():
+                    linkedin_url = href
+                elif not twitter_url and ('twitter.com' in href.lower() or 'x.com' in href.lower()):
+                    twitter_url = href
+
+        if role and any(kw in role.lower() for kw in excluded_keywords):
+            continue
+
+        members.append({
+            "name": name,
+            "role": role,
+            "linkedin_url": linkedin_url,
+            "twitter_url": twitter_url,
+            "source": "cryptorank_team_page",
+            "source_url": team_url,
+        })
+        linkedin_str = "with LinkedIn" if linkedin_url else "no LinkedIn"
+        twitter_str = "with Twitter" if twitter_url else "no Twitter"
+        print(f" {len(members)}. {name} - {role if role else 'No role found'}, {linkedin_str}, {twitter_str}")
+
+    return members
+
+
+def _build_website_info_from_url(website):
+    """Convert a raw website URL string to the {website, domain} dict used
+    elsewhere in the pipeline.  Returns None if the URL is invalid or Telegram."""
+    if not website:
+        return None
+    if 't.me' in website.lower() or 'telegram' in website.lower():
+        print(f" Found telegram URL instead of website: {website} — skipping")
+        return None
+    if not website.startswith('http'):
+        website = 'https://' + website
+    try:
+        domain = urlparse(website).netloc
+        if domain.startswith('www.'):
+            domain = domain[4:]
+        if 't.me' in domain.lower() or 'telegram' in domain.lower():
+            print(f" Domain appears to be telegram: {domain} — skipping")
             return None
+        print(f" Successfully found website: {website} (domain: {domain})")
+        return {"website": website, "domain": domain}
+    except Exception:
+        print(f" Could not parse website URL: {website}")
+        return None
+
+
+# Tracks whether we've already sent the cookie-expiry Slack warning this run
+_cryptorank_cookie_warning_sent = False
+
+
+def _fetch_cryptorank_combined(project_url, context):
+    """Extract company website AND team for a CryptoRank project.
+
+    Uses the shared browser *context* (page-per-project, same session cookies).
+    Returns: (website_info dict | None, list of member dicts)
+    """
+    global _cryptorank_cookie_warning_sent
+    website_info = None
+    team = []
+
+    page = _new_stealth_page(context)
+
+    try:
+        # ── Step 1: Main project page → extract website ──────────────────────
+        print(f"\n Extracting company website from main project page: {project_url}")
+        try:
+            page.goto(project_url, wait_until="domcontentloaded", timeout=30000)
+            print(" Main project page loaded")
+            _sleep(2)
+
+            # Mid-run Cloudflare check
+            if _is_cloudflare_blocked(page):
+                print(" Cloudflare challenge on project page — skipping this project")
+                page.close()
+                return None, []
+
+            soup = BeautifulSoup(page.content(), "html.parser")
+            website_url = _parse_cryptorank_website_from_soup(soup)
+            website_info = _build_website_info_from_url(website_url)
+            if website_info:
+                print(f" Website found: {website_info['website']} (domain: {website_info['domain']})")
+            else:
+                print("  No website found")
+        except Exception as e:
+            print(f" Error loading main page: {e}")
+
+        # ── Check for login redirect (expired/missing cookies) ────────────────
+        if any(x in page.url for x in ("login", "signin", "sign-in")):
+            print(" CryptoRank session expired or not set — team social links will be missing")
+            print(" To fix: run save_cookies.py locally and update the CRYPTORANK_COOKIES secret")
+            if not _cryptorank_cookie_warning_sent:
+                _cryptorank_cookie_warning_sent = True
+                try:
+                    send_error_to_slack(
+                        "⚠️ CryptoRank session expired — team LinkedIn/Twitter links are missing this week.\n"
+                        "Run `python save_cookies.py` locally and update the `CRYPTORANK_COOKIES` GitHub Secret."
+                    )
+                except Exception:
+                    pass
+            page.close()
+            return website_info, []
+
+        # ── Step 2: Navigate to /team page ────────────────────────────────────
+        team_url = project_url.replace('/ico/', '/price/').split('#')[0].rstrip('/') + '/team'
+
+        print(f"\n{'='*60}")
+        print(f" STEP 2: Fetching team members from {project_url}")
+        print(f"{'='*60}")
+        print(f" Loading team page: {team_url}")
+
+        loaded = False
+        for attempt in range(2):
+            try:
+                page.goto(team_url, wait_until="domcontentloaded", timeout=30000)
+                print(" Team page loaded")
+                loaded = True
+                break
+            except Exception as e:
+                if attempt == 0:
+                    print(f" Attempt 1 failed: {e}  Retrying in 5 seconds...")
+                    time.sleep(5)
+                else:
+                    print(f" Team page failed to load after 2 attempts: {e}")
+
+        if not loaded:
+            page.close()
+            return website_info, []
+
+        _sleep(3)
+        print(" Waited for JavaScript to render")
+
+        print("\n Searching for team members...")
+        team = _parse_team_from_cryptorank_soup(
+            BeautifulSoup(page.content(), "html.parser"),
+            team_url,
+        )
+        print(f"\n Total team members found: {len(team)}")
+
+    except Exception as e:
+        print(f" Unexpected error processing {project_url}: {e}")
+
+    page.close()
+    return website_info, team
+
+
+def extract_company_website(project_url, context):
+    """Extract company website from a RootData (or unknown) project page.
+
+    Uses the shared browser *context* — no new browser launch needed.
+    For CryptoRank projects the main pipeline calls _fetch_cryptorank_combined()
+    instead, which also handles team scraping.
+    """
+    print(f"\n Extracting company website from main project page: {project_url}")
+
+    page = _new_stealth_page(context)
+
+    try:
+        page.goto(project_url, wait_until="domcontentloaded", timeout=30000)
+        print(" Main project page loaded")
+        _sleep(2)
+        soup = BeautifulSoup(page.content(), "html.parser")
+
+        website = None
+
+        if 'cryptorank.io' in project_url:
+            # Fallback path — shouldn't normally be reached from gather_all.
+            website = _parse_cryptorank_website_from_soup(soup)
+
+        elif 'rootdata.com' in project_url:
+            print(" Looking for website in RootData project details...")
+            website_links = soup.find_all('a', href=True)
+            print(f" Found {len(website_links)} links on RootData page")
+            skip = [
+                'twitter', 'telegram', 'discord', 'medium', 'github', 'youtube',
+                'linkedin', 'facebook', 'instagram', 'x.com', 'rootdata.com',
+            ]
+            for link in website_links:
+                href = link.get('href', '')
+                if any(s in href.lower() for s in skip):
+                    continue
+                if href.startswith('http'):
+                    domain = urlparse(href).netloc.lower()
+                    if not any(s in domain for s in [
+                        'twitter', 'telegram', 'discord', 'medium', 'github', 'youtube',
+                        'linkedin', 'facebook', 'instagram', 'x.com', 'notion.so',
+                        'calendly.com', 'drive.google.com', 'apps.apple.com',
+                    ]):
+                        website = href
+                        print(f" Found company website link: {href}")
+                        break
+
+        result = _build_website_info_from_url(website) if website else None
+
+    except Exception as e:
+        print(f" Error extracting website: {e}")
+        result = None
+
+    page.close()
+    return result
 
 def fetch_team_from_apollo(company_name, company_website=None):
     """Apollo.io API fallback for team members
@@ -999,21 +1199,36 @@ def _load_cryptorank_cookies():
         print(f" Could not decode CRYPTORANK_COOKIES: {e}")
         return None
 
-# Tracks whether we've already sent the cookie-expiry Slack warning this run
-_cryptorank_cookie_warning_sent = False
+
+def _load_rootdata_cookies():
+    """Load RootData cookies from the ROOTDATA_COOKIES env var.
+
+    Returns a list of cookie dicts ready to pass to context.add_cookies(),
+    or None if the env var is not set / invalid.
+    """
+    raw = os.getenv("ROOTDATA_COOKIES")
+    if not raw:
+        return None
+    try:
+        import base64, json as _json
+        state = _json.loads(base64.b64decode(raw).decode())
+        return state.get("cookies", [])
+    except Exception as e:
+        print(f" Could not decode ROOTDATA_COOKIES: {e}")
+        return None
 
 def fetch_team_members(project_url):
-    print(f"\n{'='*60}")
-    print(f" STEP 2: Fetching team members from {project_url}")
-    print(f"{'='*60}")
+    """Standalone team-page scraper (kept for direct / fallback use).
 
+    For CryptoRank projects inside the main pipeline, prefer
+    _fetch_cryptorank_combined() which reuses the same browser session for
+    both website and team extraction.
+    """
     global _cryptorank_cookie_warning_sent
     storage_state = _load_cryptorank_cookies()
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
-
-        # Inject saved session cookies if available so social links are visible
         context = (
             browser.new_context(storage_state=storage_state)
             if storage_state
@@ -1021,45 +1236,38 @@ def fetch_team_members(project_url):
         )
         page = context.new_page()
 
-        # Convert /ico/ URLs to /price/.../team format
         team_url = project_url.replace('/ico/', '/price/')
         if not team_url.endswith('/team'):
-            team_url = team_url.split('#')[0]
-            team_url = team_url.rstrip('/') + '/team'
+            team_url = team_url.split('#')[0].rstrip('/') + '/team'
 
-        # Set longer timeout for page navigation
-        page.set_default_timeout(60000) # 60 seconds
+        page.set_default_timeout(30000)
 
+        print(f"\n{'='*60}")
+        print(f" STEP 2: Fetching team members from {project_url}")
+        print(f"{'='*60}")
         print(f" Loading team page: {team_url}")
-        max_retries = 2
-        for attempt in range(max_retries):
+
+        loaded = False
+        for attempt in range(2):
             try:
-                # Use 'load' instead of 'networkidle' for more reliable loading
-                page.goto(team_url, wait_until="load", timeout=60000)
+                page.goto(team_url, wait_until="domcontentloaded", timeout=30000)
                 print(" Team page loaded")
+                loaded = True
                 break
             except Exception as e:
-                if attempt < max_retries - 1:
-                    print(f" Attempt {attempt + 1} failed: {str(e)}")
-                    print(f" Retrying in 5 seconds...")
+                if attempt == 0:
+                    print(f" Attempt 1 failed: {e}  Retrying in 5 seconds...")
                     time.sleep(5)
                 else:
-                    print(f" Error loading team page after {max_retries} attempts: {str(e)}")
-                    # Try fallback with domcontentloaded
-                    try:
-                        page.goto(team_url, wait_until="domcontentloaded", timeout=60000)
-                        print(" Team page loaded with fallback method")
-                        break
-                    except Exception as e2:
-                        print(f" Fallback also failed: {str(e2)}")
-                        browser.close()
-                        return []
+                    print(f" Team page failed to load after 2 attempts: {e}")
 
-        # Detect if CryptoRank redirected us to the login page (expired/missing cookies)
+        if not loaded:
+            browser.close()
+            return []
+
         current_url = page.url
-        if "login" in current_url or "signin" in current_url or "sign-in" in current_url:
+        if any(x in current_url for x in ("login", "signin", "sign-in")):
             print(" CryptoRank session expired or not set — team social links will be missing")
-            print(" To fix: run save_cookies.py locally and update the CRYPTORANK_COOKIES secret")
             if not _cryptorank_cookie_warning_sent:
                 _cryptorank_cookie_warning_sent = True
                 try:
@@ -1071,574 +1279,345 @@ def fetch_team_members(project_url):
                     pass
             browser.close()
             return []
-        
+
         time.sleep(3)
         print(" Waited 3 seconds for JavaScript to render")
-        
-        html = page.content()
-        soup = BeautifulSoup(html, "html.parser")
-        
+
         print("\n Searching for team members...")
-        members = []
-        
-        try:
-            name_pattern = re.compile(r'^[A-Z][a-z]+(\s+[A-Z][a-z]+){1,3}$')
+        members = _parse_team_from_cryptorank_soup(
+            BeautifulSoup(page.content(), "html.parser"),
+            team_url,
+        )
 
-            # Find name tags using CSS module class prefix (stable across deployments)
-            name_tags = soup.find_all('p', class_=lambda x: x and any('styles_name__' in c for c in (x if isinstance(x, list) else [x])))
-            print(f" Found {len(name_tags)} team member elements")
-
-            excluded_keywords = [
-                'cto', 'chief technology', 'tech lead', 'engineer', 'engineering',
-                'developer', 'software', 'backend', 'frontend', 'full stack', 'fullstack',
-                'devops', 'sre', 'infrastructure', 'architect', 'technical',
-                'hr', 'human resource', 'people operations', 'people ops', 'talent',
-                'recruiting', 'recruiter', 'recruitment', 'hiring',
-                'trader', 'trading', 'quant', 'quantitative', 'portfolio manager',
-                'market maker', 'market making', 'derivatives', 'prop trading',
-                'sales', 'account executive', 'account manager', 'business development',
-                'bdr', 'sdr', 'revenue', 'partnerships', 'partner manager',
-                'product', 'product manager', 'product owner', 'product lead', 'cpo',
-                'chief product', 'product director', 'product head'
-            ]
-
-            for name_tag in name_tags:
-                name = name_tag.get_text(strip=True)
-
-                if not name_pattern.match(name):
-                    continue
-
-                role = None
-                linkedin_url = None
-                twitter_url = None
-
-                # Find the card container (parent div with styles_container__ class)
-                card = name_tag.find_parent('div', class_=lambda x: x and any('styles_container__' in c for c in (x if isinstance(x, list) else [x])))
-                if not card:
-                    # Fallback: walk up to great-grandparent
-                    card = name_tag.find_parent()
-                    if card:
-                        card = card.find_parent()
-                    if card:
-                        card = card.find_parent()
-
-                if card:
-                    # Extract role from badge button or span
-                    badge = card.find('button', class_=lambda x: x and any('styles_badge_root__' in c for c in (x if isinstance(x, list) else [x])))
-                    if badge:
-                        role = badge.get_text(strip=True)
-                    else:
-                        # Fallback: look for next sibling <p> (old layout)
-                        next_p = name_tag.find_next_sibling('p')
-                        if next_p:
-                            potential_role = next_p.get_text(strip=True)
-                            if potential_role and len(potential_role) < 50 and not name_pattern.match(potential_role):
-                                role = potential_role
-
-                    # Extract social links from the card container
-                    for a in card.find_all('a', href=True):
-                        href = a['href']
-                        if not linkedin_url and 'linkedin.com' in href.lower():
-                            linkedin_url = href
-                        elif not twitter_url and ('twitter.com' in href.lower() or 'x.com' in href.lower()):
-                            twitter_url = href
-
-                if role and any(kw in role.lower() for kw in excluded_keywords):
-                    continue
-
-                member_data = {
-                    "name": name,
-                    "role": role,
-                    "linkedin_url": linkedin_url,
-                    "twitter_url": twitter_url,
-                    "source": "cryptorank_team_page",
-                    "source_url": team_url
-                }
-                members.append(member_data)
-
-                linkedin_str = "with LinkedIn" if linkedin_url else "no LinkedIn"
-                twitter_str = "with Twitter" if twitter_url else "no Twitter"
-                print(f" {len(members)}. {name} - {role if role else 'No role found'}, {linkedin_str}, {twitter_str}")
-        
-        except Exception as e:
-            print(f" Error parsing team members: {str(e)}")
-            import traceback
-            traceback.print_exc()
-        
         browser.close()
-        
         print(f"\n Total team members found: {len(members)}")
         return members
 
-def extract_twitter_username(twitter_url):
-    """Extract username from a Twitter/X URL"""
-    if not twitter_url:
-        return None
-    url = twitter_url.strip().rstrip('/')
-    # Handle twitter.com/username and x.com/username
-    match = re.search(r'(?:twitter\.com|x\.com)/(@?[\w]+)', url, re.IGNORECASE)
-    if match:
-        username = match.group(1).lstrip('@')
-        # Skip non-profile paths
-        if username.lower() in ('home', 'explore', 'search', 'settings', 'i', 'intent', 'share'):
-            return None
-        return username
-    return None
+def _lead_exists_in_releasi(linkedin_url: str, headers: dict) -> bool:
+    """Return True if a lead with this LinkedIn URL already exists in Releasi.
 
-def get_company_shorthands(company_name):
-    """Derive shorthand tokens from a company name for username pattern generation.
-
-    e.g. "Open Campus" → ["open", "campus", "opencampus", "oc"]
-         "LayerZero Labs" → ["layer", "zero", "layerzero", "lz"]
-         "DeFi Technologies" → ["defi"]
-    """
-    if not company_name or not company_name.isascii():
-        return []
-
-    SUFFIXES = {
-        'labs', 'protocol', 'protocols', 'network', 'networks', 'finance',
-        'technologies', 'technology', 'tech', 'dao', 'foundation', 'capital',
-        'ventures', 'venture', 'inc', 'ltd', 'llc', 'co', 'corp', 'group',
-        'platform', 'platforms', 'exchange', 'markets', 'market', 'ecosystem'
-    }
-
-    # Split camelCase boundaries first, then split on spaces/hyphens/underscores
-    name_spaced = re.sub(r'([a-z])([A-Z])', r'\1 \2', company_name.strip())
-    words = re.split(r'[\s\-_]+', name_spaced)
-    words = [w for w in words if w]
-
-    meaningful = [w for w in words if w.lower() not in SUFFIXES]
-    if not meaningful:
-        meaningful = words  # fallback: nothing was left after stripping suffixes
-
-    shorthands = set()
-
-    # Each meaningful word individually
-    for w in meaningful:
-        clean = re.sub(r'[^a-zA-Z0-9]', '', w)
-        if clean and len(clean) >= 2:
-            shorthands.add(clean.lower())
-
-    # Full joined form (for multi-word companies)
-    if len(meaningful) > 1:
-        full = re.sub(r'[^a-zA-Z0-9]', '', ''.join(meaningful))
-        if full:
-            shorthands.add(full.lower())
-        # Initials (e.g. "Open Campus" → "oc")
-        if 2 <= len(meaningful) <= 4:
-            initials = ''.join(w[0] for w in meaningful if w)
-            if len(initials) >= 2:
-                shorthands.add(initials.lower())
-
-    return list(shorthands)
-
-
-def score_entity_match(entity, person_name, candidate, candidate_idx, company_shorthands):
-    """Score how well a Telegram entity matches a person.
-
-    Returns a float score (higher = better match), or None if first name doesn't match
-    (used to reject obvious false positives).
-
-    Scoring:
-      +3  first name AND last name both match TG profile
-      +1  first name matches only (last name often missing on TG)
-      +1  candidate contains a company shorthand (more specific pattern)
-      +0–0.5  small positional bonus (earlier candidates are more likely)
-    None → first name doesn't match at all → reject
-    """
-    tg_first = (entity.first_name or '').lower().strip()
-    tg_last  = (entity.last_name  or '').lower().strip()
-    parts = person_name.lower().split()
-    person_first = parts[0] if parts else ''
-    person_last  = parts[-1] if len(parts) > 1 else ''
-
-    first_match = bool(person_first and (person_first in tg_first or tg_first in person_first))
-    last_match  = bool(person_last  and (person_last  in tg_last  or tg_last  in person_last))
-
-    if not first_match:
-        return None  # Reject — first name is the minimum bar
-
-    score = 3.0 if (first_match and last_match) else 1.0
-
-    # Company-pattern bonus: candidate contains a company shorthand
-    candidate_lower = candidate.lower()
-    if any(co in candidate_lower for co in company_shorthands):
-        score += 1.0
-
-    # Small positional bonus: earlier candidates are more likely patterns
-    score += max(0.0, 0.5 - candidate_idx * 0.02)
-
-    return score
-
-
-def generate_name_candidates(name, company_name=None):
-    """Generate Telegram username candidates from a person's name and company.
-
-    Candidate order (most → least likely):
-      1. first_co, firstCo, co_first, CoFirst  (first + company)
-      2. last_co,  lastCo,  co_last,  CoLast   (last  + company)
-      3. no-separator variants: firstco, cofirst, lastco, colast
-      4. JohnDoe, john_doe, johndoe             (name-only)
-      5. johnd, jdoe                            (abbreviated)
-
-    Returns deduplicated list of valid TG usernames (5–32 chars, [a-zA-Z0-9_]).
-    """
-    if not name:
-        return []
-    parts = name.strip().split()
-    if len(parts) < 2:
-        return []
-    first = parts[0]
-    last  = parts[-1]
-    if not first.isascii() or not last.isascii():
-        return []
-
-    seen = set()
-    candidates = []
-
-    def add(raw_list):
-        for c in raw_list:
-            clean = re.sub(r'[^a-zA-Z0-9_]', '', c)
-            if 5 <= len(clean) <= 32 and clean not in seen:
-                seen.add(clean)
-                candidates.append(clean)
-
-    f  = first.lower()
-    l  = last.lower()
-    Fc = first[0].upper() + first[1:].lower()  # Title-cased first
-    Lc = last[0].upper()  + last[1:].lower()   # Title-cased last
-
-    # --- Company-inclusive patterns (highest priority) ---
-    if company_name:
-        for co in get_company_shorthands(company_name):
-            Co = co[0].upper() + co[1:]  # Title-cased company shorthand
-            add([
-                # first + company
-                f"{f}_{co}",        # john_aethir
-                f"{f}{Co}",         # johnAethir
-                f"{Co}_{Fc}",       # Aethir_John
-                f"{co}_{f}",        # aethir_john
-                f"{f}{co}",         # johnaethir
-                f"{co}{f}",         # aethirjohn
-                # last + company
-                f"{l}_{co}",        # smith_aethir
-                f"{l}{Co}",         # smithAethir
-                f"{Co}_{Lc}",       # Aethir_Smith
-                f"{co}_{l}",        # aethir_smith
-                f"{l}{co}",         # smithaethir
-                f"{co}{l}",         # aethirsmith
-            ])
-
-    # --- Name-only patterns (lower priority) ---
-    add([
-        f"{first}{last}",   # JohnDoe
-        f"{f}{l}",          # johndoe
-        f"{f}_{l}",         # john_doe
-        f"{f}{l[0]}",       # johnd
-        f"{f[0]}{l}",       # jdoe
-    ])
-
-    return candidates
-
-def resolve_telegram_usernames(people):
-    """Resolve Telegram usernames in two passes:
-
-    Pass 1: Check Twitter handles on Telegram (existing behavior).
-    Pass 2: For anyone still without a TG username, try common name-based
-            patterns (FirstLast, first_last, etc.).
+    Uses GET /api/v1/leads/lookup?linkedin_url=<url>.
+    404 → not found (green light to proceed).
+    200 → already in platform (skip).
+    Any other error is treated as unknown → proceed anyway.
     """
     try:
-        client = TelegramClient(StringSession(TELEGRAM_SESSION), TELEGRAM_API_ID, TELEGRAM_API_HASH)
-        client.connect()
-
-        if not client.is_user_authorized():
-            print(" Telegram session is not authorized, skipping resolution")
-            client.disconnect()
-            return
-
-        resolved_count = 0
-        total_checked = 0
-
-        # --- Pass 1: Twitter handles ---
-        username_to_people = {}
-        for person in people:
-            username = extract_twitter_username(person.get('twitter_url'))
-            if username:
-                username_to_people.setdefault(username, []).append(person)
-
-        if username_to_people:
-            unique_usernames = list(username_to_people.keys())
-            print(f" [Pass 1] Checking {len(unique_usernames)} Twitter usernames on Telegram...")
-
-            for i, username in enumerate(unique_usernames):
-                total_checked += 1
-                try:
-                    entity = client.get_entity(username)
-                    if isinstance(entity, User):
-                        resolved_count += 1
-                        tg_username = f"@{entity.username}" if entity.username else f"@{username}"
-                        for person in username_to_people[username]:
-                            person['telegram_username'] = tg_username
-                        print(f" {username} Telegram user found: {tg_username}")
-                    else:
-                        print(f"  {username} not a user (channel/group)")
-                except Exception:
-                    print(f" {username} not found on Telegram")
-
-                time.sleep(1.5)
-        else:
-            print(" [Pass 1] No Twitter usernames to check")
-
-        # --- Pass 2: Name + company pattern matching for unresolved people ---
-        unresolved = [p for p in people if not p.get('telegram_username') and p.get('name')]
-        if unresolved:
-            print(f"\n [Pass 2] Trying name/company patterns for {len(unresolved)} unresolved people...")
-
-            name_resolved = 0
-            for person in unresolved:
-                person_name    = person['name']
-                company_name   = person.get('project')
-                co_shorthands  = get_company_shorthands(company_name) if company_name else []
-                candidates     = generate_name_candidates(person_name, company_name)
-
-                if not candidates:
-                    continue
-
-                found_matches = []  # (score, candidate, entity, tg_username)
-
-                for idx, candidate in enumerate(candidates):
-                    total_checked += 1
-                    try:
-                        entity = client.get_entity(candidate)
-                        if isinstance(entity, User):
-                            score = score_entity_match(
-                                entity, person_name, candidate, idx, co_shorthands
-                            )
-                            if score is not None:
-                                tg_username = f"@{entity.username}" if entity.username else f"@{candidate}"
-                                found_matches.append((score, candidate, entity, tg_username))
-                                # High-confidence hit (first+last match) — no need to keep looking
-                                if score >= 3.0:
-                                    break
-                            else:
-                                print(f"  {person_name}: {candidate} exists but name mismatch "
-                                      f"(TG: {entity.first_name} {entity.last_name})")
-                    except FloodWaitError as e:
-                        print(f"  Rate limited — waiting {e.seconds}s before continuing...")
-                        time.sleep(e.seconds + 2)
-                        # Retry the same candidate once after the wait
-                        try:
-                            entity = client.get_entity(candidate)
-                            if isinstance(entity, User):
-                                score = score_entity_match(
-                                    entity, person_name, candidate, idx, co_shorthands
-                                )
-                                if score is not None:
-                                    tg_username = f"@{entity.username}" if entity.username else f"@{candidate}"
-                                    found_matches.append((score, candidate, entity, tg_username))
-                                    if score >= 3.0:
-                                        break
-                        except Exception:
-                            pass
-                    except Exception:
-                        pass  # Username not found — silently skip
-
-                    time.sleep(1.5)
-
-                if found_matches:
-                    # Rank by score descending; deduplicate by entity id
-                    seen_ids = set()
-                    unique_matches = []
-                    for match in sorted(found_matches, key=lambda x: x[0], reverse=True):
-                        eid = match[2].id
-                        if eid not in seen_ids:
-                            seen_ids.add(eid)
-                            unique_matches.append(match)
-
-                    best_score, best_candidate, _, best_tg = unique_matches[0]
-                    person['telegram_username'] = best_tg
-                    resolved_count += 1
-                    name_resolved += 1
-
-                    if len(unique_matches) > 1:
-                        alts = ', '.join(
-                            f"{tg} via {c} (score={s:.1f})"
-                            for s, c, _, tg in unique_matches[1:]
-                        )
-                        person['telegram_alternatives'] = alts
-                        print(f"  {person_name}: {best_tg} (score={best_score:.1f}, "
-                              f"pattern={best_candidate}) | alternatives: {alts}")
-                    else:
-                        print(f"  {person_name}: {best_tg} "
-                              f"(score={best_score:.1f}, pattern={best_candidate})")
-                else:
-                    print(f"  {person_name}: no match from {len(candidates)} candidates")
-
-            print(f"\n [Pass 2] Name/company resolution: {name_resolved}/{len(unresolved)} resolved")
-
-        client.disconnect()
+        resp = requests.get(
+            f"{LINAUTO_BASE_URL}/leads/lookup",
+            headers=headers,
+            params={"linkedin_url": linkedin_url},
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            return True
+        if resp.status_code == 404:
+            return False
+        # unexpected status — log and proceed
+        print(f"  ⚠ Releasi lookup returned {resp.status_code} for {linkedin_url} — proceeding", flush=True)
+        return False
     except Exception as e:
-        print(f" Telegram connection error: {str(e)}")
+        print(f"  ⚠ Releasi lookup error ({e}) — proceeding", flush=True)
+        return False
 
-    print(f"\n Telegram resolution complete: {resolved_count} total resolved, {total_checked} lookups")
+
+def resolve_telegram_via_api(people: list, between_person_delay: float = 40.0) -> None:
+    """Resolve Telegram usernames via the hosted Linauto resolver endpoint.
+
+    Before calling the Telegram resolver, checks whether the person already
+    exists in Releasi (via LinkedIn URL lookup). If they do, they're skipped —
+    the platform is the source of truth, no local cache file needed.
+
+    Calls POST /api/v1/telegram/resolve sequentially with a configurable delay
+    between calls (default 40s — the server shares a single Telegram session).
+
+    Mutates each person dict in-place, setting:
+        telegram_username     — "@handle" string, or left unset if nothing found
+        telegram_alternatives — comma-separated "@handle" strings (when present)
+
+    Args:
+        people:               list of person dicts
+        between_person_delay: seconds to sleep between API calls (default 40s)
+    """
+    if not LINAUTO_API_KEY:
+        print(" LINAUTO_API_KEY not set — skipping Telegram resolution")
+        return
+
+    auth_headers = {
+        "Authorization": f"Bearer {LINAUTO_API_KEY}",
+        "Content-Type":  "application/json",
+    }
+    resolve_endpoint = f"{LINAUTO_BASE_URL}/telegram/resolve"
+
+    candidates = [p for p in people if p.get('name')]
+    print(f" Resolving Telegram for {len(candidates)} people via Linauto API...")
+
+    # Filter out people already in Releasi (LinkedIn URL check)
+    to_resolve = []
+    skipped_existing = 0
+    skipped_no_linkedin = 0
+    for person in candidates:
+        linkedin = (person.get('linkedin_url') or '').strip()
+        if not linkedin:
+            # No LinkedIn URL — can't dedup, skip entirely
+            skipped_no_linkedin += 1
+        elif _lead_exists_in_releasi(linkedin, auth_headers):
+            skipped_existing += 1
+            print(f"  ↩ {person['name']}: already in Releasi — skipping", flush=True)
+        else:
+            to_resolve.append(person)
+
+    if skipped_existing:
+        print(f"  {skipped_existing} already in Releasi (skipped), {len(to_resolve)} to resolve")
+
+    resolved_count = 0
+    for idx, person in enumerate(to_resolve, 1):
+        name    = person['name']
+        payload = {"name": name}
+        if person.get('project'):
+            payload['company']     = person['project']
+        if person.get('twitter_url'):
+            payload['twitter_url'] = person['twitter_url']
+
+        print(f" [{idx}/{len(to_resolve)}] Resolving: {name}...", flush=True)
+        try:
+            resp = requests.post(resolve_endpoint, headers=auth_headers, json=payload, timeout=60)
+
+            if resp.status_code == 200:
+                data       = resp.json()
+                best_match = data.get('best_match')
+                if best_match:
+                    tg = best_match if best_match.startswith('@') else f"@{best_match}"
+                    person['telegram_username'] = tg
+                    resolved_count += 1
+                    alts = data.get('alternatives') or []
+                    if alts:
+                        person['telegram_alternatives'] = ', '.join(
+                            a if a.startswith('@') else f"@{a}" for a in alts
+                        )
+                    print(f"  ✓ {name}: {tg}", flush=True)
+                else:
+                    print(f"  – {name}: no match found", flush=True)
+
+            elif resp.status_code == 401:
+                print("  Linauto API auth failed — check LINAUTO_API_KEY. Aborting Telegram phase.")
+                break
+            else:
+                print(f"  Linauto API error {resp.status_code} for {name}: {resp.text[:200]}", flush=True)
+
+        except requests.exceptions.Timeout:
+            print(f"  Timeout (>60 s) resolving {name} — skipping", flush=True)
+        except Exception as e:
+            print(f"  Error resolving {name}: {e}", flush=True)
+
+        # Respectful delay between calls (server shares one Telegram session)
+        if idx < len(to_resolve):
+            print(f"  ⏳ waiting {int(between_person_delay)}s before next call...", flush=True)
+            time.sleep(between_person_delay)
+
+    total_with_tg = sum(1 for p in candidates if p.get('telegram_username'))
+    print(f"\n Telegram resolution complete: {resolved_count} newly resolved, {total_with_tg}/{len(candidates)} total with Telegram handles")
+
+def _merge_apollo_into_team(team: list, apollo_team: list) -> list:
+    """Merge Apollo results into a scraped team list in-place. Returns the team."""
+    excluded_role_keywords = [
+        'cto', 'chief technology', 'tech lead', 'engineer', 'engineering',
+        'developer', 'software', 'backend', 'frontend', 'full stack', 'fullstack',
+        'devops', 'sre', 'infrastructure', 'architect', 'technical',
+        'hr', 'human resource', 'people operations', 'people ops', 'talent',
+        'recruiting', 'recruiter', 'recruitment', 'hiring',
+        'trader', 'trading', 'quant', 'quantitative', 'portfolio manager',
+        'market maker', 'market making', 'derivatives', 'prop trading',
+        'sales', 'account executive', 'account manager', 'business development',
+        'bdr', 'sdr', 'revenue', 'partnerships', 'partner manager',
+        'product', 'product manager', 'product owner', 'product lead', 'cpo',
+        'chief product', 'product director', 'product head',
+    ]
+    existing_names = {m['name'].lower() for m in team}
+
+    for apollo_member in apollo_team:
+        role_lower = (apollo_member.get('role') or '').lower()
+        if role_lower and any(kw in role_lower for kw in excluded_role_keywords):
+            continue
+
+        if apollo_member['name'].lower() not in existing_names:
+            team.append(apollo_member)
+            print(f" Added from Apollo: {apollo_member['name']}")
+        else:
+            for existing in team:
+                if existing['name'].lower() == apollo_member['name'].lower():
+                    if not existing.get('linkedin_url') and apollo_member.get('linkedin_url'):
+                        existing['linkedin_url'] = apollo_member['linkedin_url']
+                        print(f" Added LinkedIn for {existing['name']}")
+                    if not existing.get('twitter_url') and apollo_member.get('twitter_url'):
+                        existing['twitter_url'] = apollo_member['twitter_url']
+                        print(f" Added Twitter for {existing['name']}")
+                    if not existing.get('email') and apollo_member.get('email'):
+                        existing['email'] = apollo_member['email']
+                        print(f" Added email for {existing['name']}")
+                    if apollo_member.get('apollo_person_id') and not existing.get('apollo_person_id'):
+                        existing['apollo_person_id'] = apollo_member['apollo_person_id']
+                        print(f" Added Apollo person ID for {existing['name']}")
+                    if not existing.get('role') and apollo_member.get('role'):
+                        existing['role'] = apollo_member['role']
+                        print(f" Added role for {existing['name']}: {apollo_member['role']}")
+                    if existing.get('source') == 'cryptorank_team_page':
+                        existing['source'] = 'cryptorank_team_page + apollo_api'
+                        existing['source_url'] = (
+                            f"{existing.get('source_url', '')} + {apollo_member.get('source_url', '')}"
+                        )
+                    break
+    return team
+
+
+def _apollo_worker(project_name: str, website_info: dict | None) -> list:
+    """Thin wrapper for fetch_team_from_apollo used by the thread pool."""
+    try:
+        return fetch_team_from_apollo(project_name, website_info)
+    except Exception as e:
+        print(f" Apollo worker error for {project_name}: {e}")
+        return []
+
 
 def gather_all():
-    """Main function to gather all team members from all sources"""
+    """Main pipeline: scrape → Apollo (concurrent) → Telegram → CSV."""
     print("\n" + "="*60)
     print(" STARTING DATA COLLECTION PROCESS")
     print("="*60)
-    
-    projects = get_all_projects()
-    
-    if not projects:
-        print("\n ERROR: No projects found! Cannot continue.")
-        return []
-    
-    all_people = []
-    print(f"\n Processing all {len(projects)} projects\n")
 
-    for idx, project in enumerate(projects, 1):
-        print(f"\n{'='*60}")
-        print(f" Processing {idx}/{len(projects)}: {project['name']}")
-        print(f" Source: {project['source']}")
-        print(f"{'='*60}")
-        
-        team = []
+    # ── Checkpoint: resume from a previous partial run if available ──────────
+    checkpoint = _load_checkpoint()
+    if checkpoint:
+        skipped = len(checkpoint)
+        print(f" ✓ Checkpoint found — {skipped} project(s) already scraped, will skip them")
 
-        # Extract company website first
-        website_info = extract_company_website(project['url'])
-        if website_info and website_info.get('domain'):
-            print(f" Website found: {website_info['website']} (domain: {website_info['domain']})")
-        else:
-            print("  No website found")
+    # ── Phase 1: Browser scraping (sequential, single Chromium session) ──────
+    # scraped_data maps project_url → {project, website_info, team}
+    scraped_data: dict[str, dict] = dict(checkpoint)  # pre-populate from checkpoint
 
-        # Always scrape CryptoRank team page for CryptoRank projects
-        if project['source'] == 'cryptorank_funding_rounds':
-            team = fetch_team_members(project['url'])
-        else:
-            print(" ℹ RootData project - skipping team page, will use Apollo")
+    with sync_playwright() as p:
+        browser, context = _create_browser_context(p)
+        print(" ✓ Browser launched (single session for entire run)")
 
-        # Use Apollo to supplement: fill missing LinkedIn/Twitter, add extra members
-        should_use_apollo = False
-        if not team:
-            print("  No team members found - will try Apollo")
-            should_use_apollo = True
-        else:
-            members_without_linkedin = [m for m in team if not m.get('linkedin_url')]
-            if members_without_linkedin:
-                print(f"  {len(members_without_linkedin)} team member(s) have no LinkedIn - will try Apollo")
-                should_use_apollo = True
-            elif website_info and website_info.get('domain'):
-                print(f" ℹ Will also check Apollo for additional team members")
-                should_use_apollo = True
-        
-        # Apollo search
-        if should_use_apollo:
-            time.sleep(2)
-            apollo_team = fetch_team_from_apollo(project['name'], website_info)
-            
-            if apollo_team:
-                existing_names = {m['name'].lower() for m in team}
-                
-                # Roles to exclude from results
-                excluded_role_keywords = [
-                    'cto', 'chief technology', 'tech lead', 'engineer', 'engineering',
-                    'developer', 'software', 'backend', 'frontend', 'full stack', 'fullstack',
-                    'devops', 'sre', 'infrastructure', 'architect', 'technical',
-                    'hr', 'human resource', 'people operations', 'people ops', 'talent',
-                    'recruiting', 'recruiter', 'recruitment', 'hiring',
-                    'trader', 'trading', 'quant', 'quantitative', 'portfolio manager',
-                    'market maker', 'market making', 'derivatives', 'prop trading',
-                    'sales', 'account executive', 'account manager', 'business development',
-                    'bdr', 'sdr', 'revenue', 'partnerships', 'partner manager',
-                    'product', 'product manager', 'product owner', 'product lead', 'cpo',
-                    'chief product', 'product director', 'product head'
-                ]
-                for apollo_member in apollo_team:
-                    apollo_role = apollo_member.get('role', '')
-                    role_lower = apollo_role.lower() if apollo_role else ''
-                    if role_lower and any(excluded in role_lower for excluded in excluded_role_keywords):
-                        continue
-                    
-                    if apollo_member['name'].lower() not in existing_names:
-                        team.append(apollo_member)
-                        print(f" Added from Apollo: {apollo_member['name']}")
-                    else:
-                        for existing_member in team:
-                            if existing_member['name'].lower() == apollo_member['name'].lower():
-                                # Update LinkedIn if Apollo has it and member doesn't
-                                if not existing_member.get('linkedin_url') and apollo_member.get('linkedin_url'):
-                                    existing_member['linkedin_url'] = apollo_member['linkedin_url']
-                                    print(f" Added LinkedIn for {existing_member['name']}")
-                                
-                                # Update Twitter if Apollo has it and member doesn't
-                                if not existing_member.get('twitter_url') and apollo_member.get('twitter_url'):
-                                    existing_member['twitter_url'] = apollo_member['twitter_url']
-                                    print(f" Added Twitter for {existing_member['name']}")
+        try:
+            projects = get_all_projects(context)
+        except Exception as e:
+            print(f" ERROR fetching projects: {e}")
+            browser.close()
+            return []
 
-                                # Update email if Apollo has it and member doesn't
-                                if not existing_member.get('email') and apollo_member.get('email'):
-                                    existing_member['email'] = apollo_member['email']
-                                    print(f" Added email for {existing_member['name']}")
+        if not projects:
+            print("\n ERROR: No projects found! Cannot continue.")
+            browser.close()
+            return []
 
-                                # Update Apollo person ID if available (for efficient enrichment)
-                                if apollo_member.get('apollo_person_id') and not existing_member.get('apollo_person_id'):
-                                    existing_member['apollo_person_id'] = apollo_member['apollo_person_id']
-                                    print(f" Added Apollo person ID for {existing_member['name']}")
-                                
-                                # Update role if it was missing
-                                if not existing_member.get('role') and apollo_member.get('role'):
-                                    existing_member['role'] = apollo_member['role']
-                                    print(f" Added role for {existing_member['name']}: {apollo_member['role']}")
-                                
-                                # Update source to show it came from both
-                                if existing_member.get('source') == 'cryptorank_team_page':
-                                    existing_member['source'] = 'cryptorank_team_page + apollo_api'
-                                    existing_member['source_url'] = f"{existing_member.get('source_url', '')} + {apollo_member.get('source_url', '')}"
-                                break
-        
-        # Add each team member as individual entry with project info
+        print(f"\n Processing all {len(projects)} projects\n")
+
+        for idx, project in enumerate(projects, 1):
+            url = project['url']
+
+            # Skip projects already in the checkpoint
+            if url in scraped_data:
+                print(f"\n [{idx}/{len(projects)}] {project['name']} — skipped (checkpoint)")
+                continue
+
+            print(f"\n{'='*60}")
+            print(f" Processing {idx}/{len(projects)}: {project['name']}")
+            print(f" Source: {project['source']}")
+            print(f"{'='*60}")
+
+            if project['source'] == 'cryptorank_funding_rounds':
+                website_info, team = _fetch_cryptorank_combined(url, context)
+            else:
+                print(" ℹ RootData project - skipping team page, will use Apollo")
+                website_info = extract_company_website(url, context)
+                team = []
+
+            if website_info and website_info.get('domain'):
+                print(f" Website found: {website_info['website']} (domain: {website_info['domain']})")
+            else:
+                print("  No website found")
+
+            entry = {'project': project, 'website_info': website_info, 'team': team}
+            scraped_data[url] = entry
+
+            # Persist after every project so a crash loses at most one project
+            _save_checkpoint(scraped_data)
+
+        browser.close()
+        print(" ✓ Browser closed")
+
+    # ── Phase 2: Apollo enrichment (concurrent HTTP — no browser needed) ─────
+    print(f"\n{'='*60}")
+    print(f" APOLLO PHASE: enriching {len(scraped_data)} projects concurrently (max 3 threads)")
+    print(f"{'='*60}\n")
+
+    apollo_results: dict[str, list] = {}
+
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        futures = {
+            executor.submit(
+                _apollo_worker,
+                data['project']['name'],
+                data['website_info'],
+            ): url
+            for url, data in scraped_data.items()
+        }
+        for future in as_completed(futures):
+            url = futures[future]
+            name = scraped_data[url]['project']['name']
+            try:
+                apollo_results[url] = future.result()
+                print(f" ✓ Apollo done: {name} ({len(apollo_results[url])} members)")
+            except Exception as e:
+                print(f"  Apollo failed for {name}: {e}")
+                apollo_results[url] = []
+
+    # ── Phase 3: Merge scraping + Apollo, build all_people ───────────────────
+    all_people: list[dict] = []
+
+    for url, data in scraped_data.items():
+        project      = data['project']
+        website_info = data['website_info']
+        team         = list(data['team'])   # copy so checkpoint data stays clean
+
+        apollo_team = apollo_results.get(url, [])
+        if apollo_team:
+            team = _merge_apollo_into_team(team, apollo_team)
+
         for member in team:
-            person_entry = {
-                "name": member['name'],
-                "role": member.get('role'),
-                "linkedin_url": member.get('linkedin_url'),
-                "twitter_url": member.get('twitter_url'),
-                "apollo_person_id": member.get('apollo_person_id'),
-                "source": member.get('source', 'cryptorank_team_page'),
-                "source_url": member.get('source_url', ''),
-                "project": project['name'],
-                "project_url": project['url'],
+            all_people.append({
+                "name":               member['name'],
+                "role":               member.get('role'),
+                "linkedin_url":       member.get('linkedin_url'),
+                "twitter_url":        member.get('twitter_url'),
+                "apollo_person_id":   member.get('apollo_person_id'),
+                "source":             member.get('source', 'cryptorank_team_page'),
+                "source_url":         member.get('source_url', ''),
+                "project":            project['name'],
+                "project_url":        project['url'],
                 "project_source_url": project.get('source_url', 'https://cryptorank.io/funding-rounds'),
-                "company_website": website_info['website'] if website_info else None
-            }
-            all_people.append(person_entry)
-        
-        # If no team members found, still add project info with website
+                "company_website":    website_info['website'] if website_info else None,
+            })
+
         if not team:
-            print(f" No team members found, adding project info with website")
-            person_entry = {
-                "name": None,
-                "role": None,
-                "linkedin_url": None,
-                "source": "project_only",
-                "source_url": "",
-                "project": project['name'],
-                "project_url": project['url'],
+            print(f" No team members found for {project['name']}, adding project info only")
+            all_people.append({
+                "name": None, "role": None, "linkedin_url": None,
+                "source": "project_only", "source_url": "",
+                "project": project['name'], "project_url": project['url'],
                 "project_source_url": project.get('source_url', 'https://cryptorank.io/funding-rounds'),
-                "company_website": website_info['website'] if website_info else None
-            }
-            all_people.append(person_entry)
-        
-        print(f" Successfully processed {project['name']} - Added {len(team)} people")
-    
+                "company_website": website_info['website'] if website_info else None,
+            })
+
+        print(f" Successfully processed {project['name']} — {len(team)} people")
+
     print("\n" + "="*60)
     print(f" COLLECTION COMPLETE!")
-    print(f" Total projects processed: {len(projects)}")
+    print(f" Total projects processed: {len(scraped_data)}")
     print(f" Total people collected: {len(all_people)}")
     print("="*60 + "\n")
-    
-    # Email enrichment via Apollo bulk API (costs credits)
+
+    # ── Phase 4: Email enrichment (Apollo bulk, costs credits) ───────────────
     people_to_enrich = [p for p in all_people if p.get('apollo_person_id') or p.get('linkedin_url')]
     if people_to_enrich:
         enrichment_results = enrich_people_with_emails(people_to_enrich)
@@ -1652,16 +1631,23 @@ def gather_all():
                     enriched_count += 1
         print(f"\n Enrichment complete: Added emails to {enriched_count} people")
 
-    # Telegram username resolution phase (Pass 1: Twitter handles, Pass 2: name patterns)
+    # ── Phase 5: Telegram resolution ─────────────────────────────────────────
     people_with_names = [p for p in all_people if p.get('name')]
     if people_with_names:
         twitter_count = sum(1 for p in all_people if p.get('twitter_url'))
-        print(f"\n{'='*60}")
-        print(f" TELEGRAM PHASE: {twitter_count} Twitter handles + {len(people_with_names)} name-based lookups")
-        print(f"{'='*60}\n")
-        resolve_telegram_usernames(all_people)
+        print(f"\n{'='*60}", flush=True)
+        print(f" TELEGRAM PHASE: {twitter_count} Twitter handles + {len(people_with_names)} name-based lookups", flush=True)
+        print(f"{'='*60}\n", flush=True)
+        try:
+            resolve_telegram_via_api(all_people)
+        except Exception as e:
+            print(f" Telegram resolution error: {e} — continuing with partial results", flush=True)
     else:
         print(f"\n No people to check on Telegram")
+
+    # ── Clean up checkpoint on successful completion ──────────────────────────
+    _clear_checkpoint()
+    print(" ✓ Checkpoint cleared", flush=True)
 
     return all_people
 

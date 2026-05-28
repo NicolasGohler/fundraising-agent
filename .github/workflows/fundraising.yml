@@ -7,6 +7,7 @@ on:
 jobs:
   scrape:
     runs-on: ubuntu-latest
+    timeout-minutes: 90  # Kill the job after 90 min instead of silently burning 6 h
     
     steps:
       - name: Checkout code
@@ -37,6 +38,7 @@ jobs:
           TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
           TELEGRAM_SESSION: ${{ secrets.TELEGRAM_SESSION }}
           CRYPTORANK_COOKIES: ${{ secrets.CRYPTORANK_COOKIES }}
+          ROOTDATA_COOKIES: ${{ secrets.ROOTDATA_COOKIES }}
           LINAUTO_API_KEY: ${{ secrets.LINAUTO_API_KEY }}
         run: python fundraising.py
         
@@ -47,6 +49,6 @@ jobs:
           path: |
             Fundraises - *
           retention-days: 30
-          
+
       # Note: Slack upload is handled by the Python script itself (send_to_slack function)
       # No need to upload here to avoid duplicates
