@@ -76,12 +76,39 @@ def _new_stealth_page(context):
     return page
 
 
+def _build_proxy_config() -> dict | None:
+    """Return a Playwright proxy dict if PROXY_SERVER is configured, else None.
+
+    Expected env vars:
+        PROXY_SERVER   — e.g. "http://geo.iproyal.com:12321"  (required to enable)
+        PROXY_USERNAME — proxy username
+        PROXY_PASSWORD — full proxy password, including any sticky-session
+                         parameters appended by the provider, e.g.
+                         "pass_country-us_session-abc123_lifetime-168h"
+    """
+    server = os.getenv("PROXY_SERVER")
+    if not server:
+        return None
+    cfg: dict = {"server": server}
+    username = os.getenv("PROXY_USERNAME")
+    password = os.getenv("PROXY_PASSWORD")
+    if username:
+        cfg["username"] = username
+    if password:
+        cfg["password"] = password
+    return cfg
+
+
 def _create_browser_context(playwright_instance):
     """Launch one anti-detection Chromium browser and return (browser, context).
 
     The context is pre-loaded with CryptoRank session cookies (if available)
     and a human-like viewport/UA so the same session is reused for every
     navigation in the run.
+
+    If PROXY_SERVER / PROXY_USERNAME / PROXY_PASSWORD are set, all traffic is
+    routed through the configured residential proxy so the scraping IP matches
+    any cookies captured through the same proxy.
     """
     browser = playwright_instance.chromium.launch(
         headless=True,
@@ -93,6 +120,9 @@ def _create_browser_context(playwright_instance):
         ],
     )
     storage_state = _load_cryptorank_cookies()  # resolved at call time — fine
+    proxy_cfg = _build_proxy_config()
+    if proxy_cfg:
+        print(f"  ℹ Routing browser through proxy: {proxy_cfg['server']}", flush=True)
     context = browser.new_context(
         storage_state=storage_state,
         viewport={'width': 1920, 'height': 1080},
@@ -103,6 +133,7 @@ def _create_browser_context(playwright_instance):
         ),
         locale='en-US',
         timezone_id='America/New_York',
+        **({"proxy": proxy_cfg} if proxy_cfg else {}),
     )
     return browser, context
 
@@ -1320,15 +1351,31 @@ def _lead_exists_in_releasi(linkedin_url: str, headers: dict) -> bool:
         return False
 
 
-def resolve_telegram_via_api(people: list, between_person_delay: float = 40.0) -> None:
+def resolve_telegram_via_api(people: list, between_person_delay: float = None) -> None:
     """Resolve Telegram usernames via the hosted Linauto resolver endpoint.
 
     Before calling the Telegram resolver, checks whether the person already
     exists in Releasi (via LinkedIn URL lookup). If they do, they're skipped —
     the platform is the source of truth, no local cache file needed.
 
-    Calls POST /api/v1/telegram/resolve sequentially with a configurable delay
-    between calls (default 40s — the server shares a single Telegram session).
+    Calls POST /api/v1/telegram/resolve sequentially with a dynamically
+    calculated delay between calls (the server shares a single Telegram session).
+
+    Delay is calculated to spread the run over a target window that scales with
+    headcount — minimum 12 hours, growing by ~1 hour per 10 additional people:
+
+        target_hours = max(12, num_people / 10)
+        delay        = (target_hours × 3600) / num_people
+                       clamped to [60s, 900s]
+
+    Examples (after Releasi dedup):
+        50 people  →  864 s/person  →  ~12 h total
+        100 people →  432 s/person  →  ~12 h total
+        150 people →  360 s/person  →  ~15 h total
+        200 people →  360 s/person  →  ~20 h total
+        250 people →  360 s/person  →  ~25 h total
+
+    Pass between_person_delay explicitly to override the auto-calculation.
 
     Mutates each person dict in-place, setting:
         telegram_username     — "@handle" string, or left unset if nothing found
@@ -1336,7 +1383,7 @@ def resolve_telegram_via_api(people: list, between_person_delay: float = 40.0) -
 
     Args:
         people:               list of person dicts
-        between_person_delay: seconds to sleep between API calls (default 40s)
+        between_person_delay: override delay in seconds (None = auto-calculate)
     """
     if not LINAUTO_API_KEY:
         print(" LINAUTO_API_KEY not set — skipping Telegram resolution")
@@ -1368,6 +1415,25 @@ def resolve_telegram_via_api(people: list, between_person_delay: float = 40.0) -
 
     if skipped_existing:
         print(f"  {skipped_existing} already in Releasi (skipped), {len(to_resolve)} to resolve")
+
+    # ── Auto-calculate per-person delay if not explicitly overridden ──────────
+    if between_person_delay is None:
+        num_people = len(to_resolve)
+        if num_people > 0:
+            # Target spread window grows with headcount: 12h minimum, +1h per 10 people
+            target_hours = max(12.0, num_people / 10.0)
+            raw_delay = (target_hours * 3600.0) / num_people
+            # Floor at 60s (never hammering), cap at 900s (15 min, avoids absurd
+            # waits for tiny runs where target_hours/n would be huge)
+            between_person_delay = max(60.0, min(900.0, raw_delay))
+            estimated_hours = (between_person_delay * num_people) / 3600.0
+            print(
+                f"  ⏱ {num_people} people → {int(between_person_delay)}s/person "
+                f"→ estimated {estimated_hours:.1f}h total spread",
+                flush=True,
+            )
+        else:
+            between_person_delay = 360.0  # fallback, won't actually be used
 
     resolved_count = 0
     for idx, person in enumerate(to_resolve, 1):

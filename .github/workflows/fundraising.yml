@@ -40,6 +40,9 @@ jobs:
           CRYPTORANK_COOKIES: ${{ secrets.CRYPTORANK_COOKIES }}
           ROOTDATA_COOKIES: ${{ secrets.ROOTDATA_COOKIES }}
           LINAUTO_API_KEY: ${{ secrets.LINAUTO_API_KEY }}
+          PROXY_SERVER: ${{ secrets.PROXY_SERVER }}
+          PROXY_USERNAME: ${{ secrets.PROXY_USERNAME }}
+          PROXY_PASSWORD: ${{ secrets.PROXY_PASSWORD }}
         run: python fundraising.py
         
       - name: Upload results as artifacts
