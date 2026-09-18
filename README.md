@@ -1,96 +1,32 @@
 # Fundraising Agent
 
-Automated agent that collects fundraising data from CryptoRank and RootData, extracts team member information, enriches with email addresses via Apollo.io, and sends results to Slack.
+Weekly investor prospecting engine for Web3 fundraising cycles.
 
-## Features
+Pulls hiring, funding, and competitor activity signals from Apollo.io and CryptoRank, enriches team contacts with emails and Telegram handles, and delivers a ranked lead list to Slack every Monday via GitHub Actions.
 
-- **Multi-source data collection**: CryptoRank funding rounds and RootData fundraising
-- **Team member extraction**: From project team pages and Apollo.io API
-- **Website extraction**: Automatically finds company websites
-- **Slack integration**: Sends results and notifications to Slack
-- **GitHub Actions**: Automated weekly runs every Monday
-- **Detailed source tracking**: Comprehensive metadata about data sources
+Built at [MPM Labs](https://mpmlabs.xyz) to power outbound fundraising motions for portfolio companies. Part of the signal infrastructure behind 7-figure pipeline generation.
 
-## Data Sources
+## How it works
 
-### Project Sources
-- **CryptoRank Funding Rounds**: `cryptorank_funding_rounds`
-- **RootData Fundraising**: `rootdata_fundraising`
-
-### Team Member Sources
-- **CryptoRank Team Pages**: `cryptorank_team_page`
-- **Apollo API**: `apollo_api`
-- **Combined Sources**: `cryptorank_team_page + apollo_api`
+1. Scrapes recent fundraising rounds from CryptoRank and RootData
+2. Extracts team members and enriches emails via Apollo.io bulk enrichment
+3. Resolves Telegram usernames for direct outreach
+4. Pushes structured results to Slack and uploads artifacts to GitHub
 
 ## Setup
 
-### Local Development
+Add these to your GitHub repository secrets:
 
-1. Clone the repository
-2. Create a virtual environment:
-   ```bash
-   python -m venv venv
-   source venv/bin/activate  # On Windows: venv\Scripts\activate
-   ```
-3. Install dependencies:
-   ```bash
-   pip install -r requirements.txt
-   playwright install chromium
-   ```
-4. Set environment variables:
-   ```bash
-   export APOLLO_API_KEY="your_apollo_api_key"
-   export SLACK_BOT_TOKEN="your_slack_bot_token"
-   export SLACK_CHANNEL="your_slack_channel_id"
-   ```
-5. Run the script:
-   ```bash
-   python fundraising.py
-   ```
+```
+APOLLO_API_KEY        Apollo.io API key
+SLACK_BOT_TOKEN       Slack bot token
+SLACK_CHANNEL         Slack channel ID
+LINAUTO_API_KEY       Optional: Telegram username resolution
+PROXY_SERVER          Optional: residential proxy
+```
 
-### GitHub Actions Setup
+The workflow runs every Monday at 9 AM UTC.
 
-1. Add the following secrets to your GitHub repository:
-   - `APOLLO_API_KEY`: Your Apollo.io API key
-   - `SLACK_BOT_TOKEN`: Your Slack bot token
-   - `SLACK_CHANNEL`: Your Slack channel ID (e.g., C09CKTZ61DK)
+## Stack
 
-2. The workflow will automatically run every Monday at 9 AM UTC
-
-## Output
-
-The script generates:
-- **JSON file**: Complete data with all metadata
-- **CSV file**: Formatted for easy analysis
-- **Slack notification**: Success/failure notifications
-- **GitHub artifacts**: Uploaded results for each run
-
-## Data Schema
-
-Each person record includes:
-- `name`: Person's name
-- `role`: Job title/role
-- `linkedin_url`: LinkedIn profile URL
-- `email`: Email address (enriched via Apollo.io bulk enrichment API)
-- `source`: Data source (e.g., `apollo_api`, `cryptorank_team_page`)
-- `source_url`: URL of the data source
-- `source_type`: Type of source (e.g., `people_database`, `project_team_page`)
-- `apollo_search_method`: How Apollo was searched (`domain` or `company_name`)
-- `project`: Project name
-- `project_url`: Project URL
-- `project_source`: Where the project was found
-- `project_source_url`: URL of the project source
-- `project_source_type`: Type of project source
-- `company_website`: Company website URL
-- `company_domain`: Company domain
-
-## Requirements
-
-- Python 3.9+
-- Playwright with Chromium
-- Apollo.io API key
-- Slack bot with appropriate permissions
-
-## License
-
-MIT License
+Python · Apollo.io · CryptoRank · Telethon · Slack SDK · GitHub Actions
